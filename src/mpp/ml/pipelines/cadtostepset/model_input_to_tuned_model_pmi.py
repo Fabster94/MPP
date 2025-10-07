@@ -13,10 +13,17 @@ import numpy as np
 import random
 
 # custom imports
-from mpp.ml.models.classifier.cadtostepset import ProcessClassificationTrsfmEncoderModule
-from mpp.ml.datasets.datamodules import MPP_datamodule
+from mpp.ml.models.classifier.cadtostepset_with_pmi import ProcessClassificationWithPMI
+from mpp.ml.datasets.datamodules_pmi import TKMS_PMI_DataModule
 from mpp.constants import PATHS
 
+
+# PMI-specific configuration
+PMI_PATH = "encoding_results/standard_encoding.npy"
+CLIP_VALUE = 5.0  # Set to 5.0 if you want to clip PMI values / None
+
+# Global variable for experiment directory
+CURRENT_EXPERIMENT_DIR = None
 
 class ModelCheckpointWithJSON(ModelCheckpoint):
     """Custom ModelCheckpoint that saves JSON metadata when checkpoint is saved"""
@@ -26,10 +33,8 @@ class ModelCheckpointWithJSON(ModelCheckpoint):
         
     def _save_checkpoint(self, trainer, filepath):
         """Override to save JSON when checkpoint is actually saved"""
-        # Save checkpoint first
         super()._save_checkpoint(trainer, filepath)
         
-        # Now save JSON with CURRENT metrics (these are the ones that triggered the save)
         if self.model_config:
             meta_path = Path(filepath).with_suffix('.json')
             
@@ -37,6 +42,9 @@ class ModelCheckpointWithJSON(ModelCheckpoint):
                 "created_at": datetime.now().isoformat(),
                 "epoch": trainer.current_epoch,
                 "hyperparameters": self.model_config,
+                "pmi_path": PMI_PATH,
+                "pmi_clip_value": CLIP_VALUE,
+                "model_type": "ProcessClassificationWithPMI",
                 "metrics": {
                     "val_loss": trainer.callback_metrics.get("val_loss", None).item() if trainer.callback_metrics.get("val_loss") else None,
                     "val_acc": trainer.callback_metrics.get("val_acc", None).item() if trainer.callback_metrics.get("val_acc") else None,
@@ -46,62 +54,55 @@ class ModelCheckpointWithJSON(ModelCheckpoint):
             with open(meta_path, 'w') as f:
                 json.dump(metadata, f, indent=4)
                 
-            # Clean up old JSONs
             for old_json in Path(filepath).parent.glob("*.json"):
                 if old_json != meta_path:
                     old_json.unlink()
-
 
 class SimpleMetadataCallback(Callback):
     # Not needed anymore if using ModelCheckpointWithJSON
     pass
 
 
-# ENV-VARS
-DATASET_SELECT = "tkms"
-
-# Global variable for experiment directory
-CURRENT_EXPERIMENT_DIR = None
-
-
-def get_dataloaders(batch_size=32, input_type="vecset", target_type="step-set"):
+def get_dataloaders(batch_size=32):
     """
-    Initializes and returns the training and validation dataloaders for classification task.
-
-    Parameters
-    ----------
-    batch_size : int, optional
-        Number of samples per batch to load. Default is 32.
-    input_type : str, optional
-        Input data format type. Default "vecset".
-    target_type : str, optional
-        Target data format type, e.g. "step-set" for classification labels. Default "step-set".
-
-    Returns
-    -------
-    tuple of torch.utils.data.DataLoader
-        A tuple containing (train_loader, validation_loader).
+    Initializes and returns the training and validation dataloaders with PMI.
     """
-    dataset = MPP_datamodule(batch_size=batch_size, input_type=input_type, target_type=target_type, dataset=DATASET_SELECT)
+    dataset = TKMS_PMI_DataModule(
+        batch_size=batch_size,
+        target_type="step-set",
+        pmi_path=PMI_PATH,
+        pmi_csv_path= "/workspace/masterthesis_cadtoplan_fabian_heinze/mpp/data_pmi/pmi_features.csv",
+        clip_value=CLIP_VALUE
+    )
+    
     dataset.setup(stage="fit")
-
+    
     train_loader = dataset.train_dataloader()
     validation_loader = dataset.val_dataloader()
-
+    
+    # Print PMI statistics
+    pmi_stats = dataset.train_dataset.get_pmi_statistics()
+    print(f"\nPMI Statistics:")
+    print(f"  Shape: {pmi_stats['shape']}")
+    print(f"  Range: [{pmi_stats['min']:.3f}, {pmi_stats['max']:.3f}]")
+    print(f"  Clipped: {pmi_stats['clipped']}")
+    
     return train_loader, validation_loader
 
 
+# Set batch size
 batch_size = 85
 train_loader, val_loader = get_dataloaders(batch_size=batch_size)
 
 
 def objective(trial):
+    """Optuna objective for hyperparameter tuning with PMI model"""
     # Generate unique trial ID
     trial_id = f"trial_{trial.number}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     
     # Setup MLflow logging with trial ID
     mlf_logger = MLFlowLogger(
-        experiment_name="cadtostepset-hyperparameter-tuning",
+        experiment_name="cadtostepset-pmi-hyperparameter-tuning",
         tracking_uri="file:./mlruns",
         run_name=trial_id
     )
@@ -113,22 +114,25 @@ def objective(trial):
     num_layers = trial.suggest_int("num_layers", 2, 5)
     num_heads = trial.suggest_categorical("num_heads", [4, 8, 16])
     weight_decay = trial.suggest_float("weight_decay", 1e-5, 1e-3, log=True)
-
     
 
     
     # Configuration parameters for tuning
     max_epochs = 50  
     
-    # Initialize model with suggested hyperparameters
-    model = ProcessClassificationTrsfmEncoderModule(
+    # Get dataloaders with trial-specific batch size
+    train_loader, val_loader = get_dataloaders(batch_size=batch_size)
+    
+    # Initialize PMI model with suggested hyperparameters
+    model = ProcessClassificationWithPMI(
         lr=lr,
         embed_dim=embed_dim,
         num_layers=num_layers,
         num_heads=num_heads,
         dropout=dropout,
         weight_decay=weight_decay,
-        max_epochs=max_epochs
+        max_epochs=max_epochs,
+        pmi_dim=30  # Fixed based on encoding
     )
     
     # Early stopping callback
@@ -137,28 +141,31 @@ def objective(trial):
         patience=15,
         mode='min',
         verbose=True,
-
     )
     
     # Create checkpoint directory with trial info
-    trial_dir = CURRENT_EXPERIMENT_DIR / "trials" / f"trial_{trial.number}"
+    trial_dir = CURRENT_EXPERIMENT_DIR / "trials" / f"trial_{trial.number}_pmi"
     trial_dir.mkdir(parents=True, exist_ok=True)
     
     checkpoint_callback = ModelCheckpointWithJSON(
         model_config={
+            "trial_number": trial.number,
             "lr": lr,
             "embed_dim": embed_dim,
             "num_layers": num_layers,
             "num_heads": num_heads,
             "dropout": dropout,
             "weight_decay": weight_decay,
-            "max_epochs": max_epochs
+            "pmi_config": {
+                "path": PMI_PATH,
+                "clip_value": CLIP_VALUE
+        }
         },
         monitor='val_loss',
         save_top_k=1,
         mode='min',
         dirpath=str(trial_dir),
-        filename='cadtostepset-{epoch:02d}-{val_loss:.4f}',
+        filename='cadtostepset-pmi-{epoch:02d}-{val_loss:.4f}',
         save_weights_only=False,
         verbose=True
     )
@@ -170,7 +177,9 @@ def objective(trial):
         enable_checkpointing=True,
         enable_model_summary=False,
         log_every_n_steps=2,
-        callbacks=[early_stop_callback, checkpoint_callback]
+        callbacks=[early_stop_callback, checkpoint_callback],
+        gradient_clip_val=1.0,  # Important for stability with multi-modal
+        precision=16  # Mixed precision für schnelleres Training
     )
     
     # Train model
@@ -184,21 +193,21 @@ def objective(trial):
     mlf_logger.log_hyperparams(trial.params)
     mlf_logger.log_metrics({
         "val_loss": val_loss,
-        "val_acc": val_acc
+        "val_acc": val_acc,
+        "batch_size": batch_size
     })
     
     # Save complete configuration
     trial_info = {
         "trial_id": trial_id,
         "trial_number": trial.number,
-        "hyperparameters": {
-            "lr": lr,
-            "embed_dim": embed_dim,
-            "num_layers": num_layers,
-            "num_heads": num_heads,
-            "dropout": dropout,
-            "weight_decay": weight_decay,
+        "model_type": "ProcessClassificationWithPMI",
+        "pmi_config": {
+            "path": PMI_PATH,
+            "clip_value": CLIP_VALUE
         },
+        "hyperparameters": trial.params,
+        "batch_size": batch_size,
         "best_checkpoint": checkpoint_callback.best_model_path,
         "metrics": {
             "val_loss": val_loss,
@@ -212,7 +221,7 @@ def objective(trial):
     with open(trial_dir / "trial_config.json", "w") as f:
         json.dump(trial_info, f, indent=4)
     
-    return val_loss  # Return value for Optuna optimization
+    return val_loss
 
 
 def main():
@@ -222,34 +231,26 @@ def main():
     ENABLE_TUNING = False  # Set to True for hyperparameter tuning
     
     mlflow.set_tracking_uri("file:./mlruns")
-    mlflow.set_experiment("classification")
+    mlflow.set_experiment("classification-pmi")
 
     if ENABLE_TUNING:
         # Tuning configuration
         N_TRIALS = 100  
         
-
-        baseline_info = {
-            "model": "cadtostepset_epoch=81_val_loss=0.3940.ckpt",
-            "val_loss": 0.39396,
-            "val_acc": 0.83796,
-            "path": "/workspace/masterthesis_cadtoplan_fabian_heinze/mpp/src/cadtoseq/ml/models/checkpoints/best_model/cadtostepset/20250902_1410_BASELINE/cadtostepset_epoch=81_val_loss=0.3940.ckpt"
-        }
-
-        
-        # Create experiment directory only for tuning
-        experiment_name = f"{datetime.now().strftime('%Y-%m-%d_%H%M')}_tuning_{N_TRIALS}trials_tkms"
+        # Create experiment directory
+        experiment_name = f"{datetime.now().strftime('%Y-%m-%d_%H%M')}_pmi_tuning_{N_TRIALS}trials"
         CURRENT_EXPERIMENT_DIR = PATHS.CKPT_DIR / "experiments" / experiment_name
         CURRENT_EXPERIMENT_DIR.mkdir(parents=True, exist_ok=True)
         
         # Save experiment metadata
         experiment_info = {
             "name": experiment_name,
-            "description": "Hyperparameter tuning run on TKMS dataset",
-            "dataset": "TKMS", 
+            "description": "Hyperparameter tuning for PMI-enhanced model on TKMS dataset",
+            "dataset": "TKMS with PMI",
+            "pmi_path": PMI_PATH,
+            "pmi_clip_value": CLIP_VALUE,
             "n_trials": N_TRIALS,
-            "created_at": datetime.now().isoformat(),
-            "baseline_performance": baseline_info
+            "created_at": datetime.now().isoformat()
         }
         
         with open(CURRENT_EXPERIMENT_DIR / "experiment_info.json", "w") as f:
@@ -261,10 +262,11 @@ def main():
         
         best_params = study.best_trial.params
         print(f"\n🏆 Best parameters found: {best_params}")
+        print(f"Best validation loss: {study.best_value:.4f}")
         
     else:
 
-        # Seeds  für finales Training setzen
+        # Seeds für finales Training setzen
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
         np.random.seed(42)
@@ -273,34 +275,37 @@ def main():
         # Für exakte Reproduzierbarkeit
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
-        # Normal training without tuning
-        mlf_logger = MLFlowLogger(experiment_name="cadtostepset", tracking_uri="file:./mlruns", run_name="baseline-training")
 
-        # Create model using defaults from cadtostepset.py
-        # Beste Parameter aus Trial 12
-        model = ProcessClassificationTrsfmEncoderModule(
-            lr=0.000806,
-            embed_dim=64,
-            num_layers=3,
-            num_heads=8,
-            dropout=0.1605,
-            weight_decay=0.0005109,
-            max_epochs=300  # Für finales Training
+        # Normal training without tuning
+        mlf_logger = MLFlowLogger(
+            experiment_name="classification-pmi",
+            tracking_uri="file:./mlruns",
+            run_name=f"baseline-pmi-{datetime.now().strftime('%Y%m%d_%H%M')}"
         )
 
-
-
-
+        # Create model with default parameters
+        # Beste Parameter aus Trial 45
+        model = ProcessClassificationWithPMI(
+            lr=0.00175,
+            embed_dim=64,
+            num_layers=2,
+            num_heads=4,
+            dropout=0.1817,
+            weight_decay=0.0001587,
+            max_epochs=300, #bei trainer gucken
+            pmi_dim=30  # Fixed based on encoding
+        )
+        
         # Timestamp for this training run
         training_timestamp = datetime.now().strftime('%Y%m%d_%H%M')
         
         # Create timestamped directory for this training run
-        checkpoint_dir = PATHS.CKPT_DIR / "best_model" / "cadtostepset" / training_timestamp
+        checkpoint_dir = PATHS.CKPT_DIR / "best_model" / "cadtostepset_pmi" / training_timestamp
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         early_stop_callback = EarlyStopping(
             monitor='val_loss',
-            patience=50,  # für finales Training
+            patience=50,  # Viel Geduld für finales Training
             mode='min',
             verbose=True,
         )
@@ -311,21 +316,43 @@ def main():
             save_top_k=1,
             mode='min',
             dirpath=str(checkpoint_dir),
-            filename='cadtostepset_{epoch:02d}_{val_loss:.4f}',
+            filename='cadtostepset_pmi_{epoch:02d}_val{val_loss:.4f}',
             save_weights_only=False,
             verbose=True
         )
 
+
+
         trainer = Trainer(
             max_epochs=300,
             logger=mlf_logger,
-            callbacks=[early_stop_callback, checkpoint_callback],  # Removed metadata_callback
+            callbacks=[early_stop_callback, checkpoint_callback],
             enable_checkpointing=True,
             enable_model_summary=False,
-            log_every_n_steps=1
+            log_every_n_steps=1,
+            gradient_clip_val=1.0  # Important for multi-modal stability
         )
 
+        # Print configuration
+        print(f"\n{'='*60}")
+        print(f"Training Configuration:")
+        print(f"  Model: ProcessClassificationWithPMI")
+        print(f"  Dataset: TKMS with PMI")
+        print(f"  PMI path: {PMI_PATH}")
+        print(f"  PMI clipping: {CLIP_VALUE}")
+        print(f"  Batch size: {batch_size}")
+        print(f"  Checkpoint dir: {checkpoint_dir}")
+        print(f"{'='*60}\n")
+
         trainer.fit(model, train_loader, val_loader)
+        
+        # Print final results
+        print(f"\n{'='*60}")
+        print(f"Training Complete!")
+        print(f"  Best checkpoint: {checkpoint_callback.best_model_path}")
+        print(f"  Final val_loss: {trainer.callback_metrics['val_loss']:.4f}")
+        print(f"  Final val_acc: {trainer.callback_metrics['val_acc']:.4f}")
+        print(f"{'='*60}\n")
 
 
 if __name__ == "__main__":

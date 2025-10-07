@@ -54,15 +54,15 @@ class ProcessClassificationTrsfmEncoderModule(pl.LightningModule):
     def __init__(
         self,
         input_dim=32,
-        embed_dim = 512,
-        num_heads = 4,
-        num_layers = 2,
-        num_classes=len(VOCAB)-3, #-3 due to STOP, PAD, START which are no process steps
-        dropout=0.3,
-        lr=1e-4,
+        embed_dim = 128,
+        num_heads = 8,
+        num_layers = 3,
+        num_classes=len(TKMS_VOCAB)-3, #-3 due to STOP, PAD, START which are no process steps
+        dropout=0.2,
+        lr=5e-5,
         weight_decay=0.01,
         threshold = 0.5,
-        max_epochs = 50
+        max_epochs = 200
     ):
         super().__init__()
 

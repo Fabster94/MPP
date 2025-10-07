@@ -7,6 +7,7 @@ import torch
 from torch.utils.data import Dataset
 import numpy as np
 import pandas as pd
+from pathlib import Path
 
 #custom imports
 from mpp.constants import PATHS, TKMS_VOCAB, INV_TKMS_VOCAB
@@ -77,10 +78,11 @@ class TKMS_Process_Dataset(Dataset):
         logger.info(f"Dataset initialized with {len(self.samples)} samples for {mode} mode with input_type: {self.input_type.upper()} target_type: {self.target_type.upper()}.")
 
 
+
     def split(self, train_size=0.8, valid_size=0.1, test_size=0.1):
         """
-        Randomly splits available samples into train, validation, and test subsets.
-
+        Creates stratified splits based on manufacturing process distributions.
+        
         Parameters
         ----------
         train_size : float
@@ -89,41 +91,113 @@ class TKMS_Process_Dataset(Dataset):
             Proportion of samples for the validation set.
         test_size : float
             Proportion of samples for the test set.
-
+            
         Raises
         ------
         ValueError
             If the proportions do not sum to 1.0.
         """
-        logger.info("Splitting dataset into train, validation and test sets...")
+        from sklearn.model_selection import train_test_split
+        from datetime import datetime
+        
+        logger.info("Creating stratified splits for TKMS dataset...")
+        
         if train_size + valid_size + test_size != 1.0:
             raise ValueError("train_size, valid_size and test_size must sum to 1.0")
-
-        all_samples = [path.stem for path in PATHS.TKMS_FEATURE_DATA.iterdir() if path.stem!= ".DS_Store" and path.is_dir()]
         
-        # shuffle the samples
-        np.random.shuffle(all_samples)
-        n_samples = len(all_samples)
-
-        train_end = int(train_size * n_samples)
-        valid_end = int((train_size + valid_size) * n_samples)
-
-        train_samples = all_samples[:train_end]
-        valid_samples = all_samples[train_end:valid_end]
-        test_samples = all_samples[valid_end:]
-
-        #create split dictionary
+        # Get all available samples
+        all_samples = [path.stem for path in PATHS.TKMS_FEATURE_DATA.iterdir() 
+                    if path.stem != ".DS_Store" and path.is_dir()]
+        
+        # Load PMI data to get process labels for stratification
+        pmi_csv_path = Path("/workspace/masterthesis_cadtoplan_fabian_heinze/pmi_features.csv")
+        if not pmi_csv_path.exists():
+            # Fallback to random split if PMI not available
+            logger.warning("PMI data not found, falling back to random split")
+            np.random.seed(42)  # For reproducibility
+            np.random.shuffle(all_samples)
+            n_samples = len(all_samples)
+            
+            train_end = int(train_size * n_samples)
+            valid_end = int((train_size + valid_size) * n_samples)
+            
+            train_samples = all_samples[:train_end]
+            valid_samples = all_samples[train_end:valid_end]
+            test_samples = all_samples[valid_end:]
+        else:
+            # Stratified split based on processes
+            pmi_df = pd.read_csv(pmi_csv_path)
+            
+            # Filter samples that exist in PMI data
+            valid_samples = []
+            sample_labels = []
+            
+            for sample in all_samples:
+                if sample in pmi_df['part_name'].values:
+                    row = pmi_df[pmi_df['part_name'] == sample].iloc[0]
+                    processes = row.get('Processes', '')
+                    
+                    # Create stratification label
+                    if pd.isna(processes) or processes == '':
+                        label = 'none'
+                    else:
+                        # Use sorted process combination as label
+                        procs = sorted(str(processes).split(','))
+                        label = '_'.join(procs)
+                    
+                    valid_samples.append(sample)
+                    sample_labels.append(label)
+            
+            if not valid_samples:
+                raise ValueError("No samples found in PMI data!")
+            
+            logger.info(f"Using {len(valid_samples)} samples with process labels for stratified split")
+            
+            # First split: train+valid vs test
+            X_temp, test_samples, y_temp, _ = train_test_split(
+                valid_samples,
+                sample_labels,
+                test_size=test_size,
+                stratify=sample_labels,
+                random_state=42
+            )
+            
+            # Second split: train vs valid
+            relative_valid_size = valid_size / (train_size + valid_size)
+            train_samples, valid_samples, _, _ = train_test_split(
+                X_temp,
+                y_temp,
+                test_size=relative_valid_size,
+                stratify=y_temp,
+                random_state=42
+            )
+        
+        # Create split dictionary
         split_dict = {
             "train": train_samples,
             "valid": valid_samples,
             "test": test_samples
         }
-        #save split dictionary to json file
-        with open(PATHS.TKMS_FEATURE_DATA / "sample_split.json", "w") as f:
+        
+        # Backup existing split if it exists
+        split_file = PATHS.TKMS_FEATURE_DATA / "sample_split.json"
+        if split_file.exists():
+            backup_name = f"sample_split_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            backup_file = PATHS.TKMS_FEATURE_DATA / backup_name
+            
+            with open(split_file, 'r') as f:
+                old_splits = json.load(f)
+            with open(backup_file, 'w') as f:
+                json.dump(old_splits, f, indent=4)
+            
+            logger.info(f"Backed up old splits to: {backup_name}")
+        
+        # Save split dictionary to json file
+        with open(split_file, "w") as f:
             json.dump(split_dict, f, indent=4)
-
+        
         logger.info(f"Split dataset into {len(train_samples)} train, {len(valid_samples)} validation and {len(test_samples)} test samples.")
-
+        
         return None
 
 
