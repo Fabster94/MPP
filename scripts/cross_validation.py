@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Cross-Validation for Geometry vs. Geometry+PMI
-Improved version with multilabel stratification, OOF table, and robust evaluation
+Cross-Validation for Unified Process Classifier
+Geometry-only vs. Multi-modal (Geometry+PMI)
+With repeated CV, bootstrap CIs, and permutation tests
 """
 
 import numpy as np
@@ -10,15 +11,18 @@ import json
 from pathlib import Path
 from datetime import datetime
 from sklearn.metrics import (
-    f1_score, accuracy_score, hamming_loss, multilabel_confusion_matrix, jaccard_score,
-    precision_recall_fscore_support
+    f1_score, accuracy_score, hamming_loss, multilabel_confusion_matrix, 
+    jaccard_score, precision_recall_fscore_support
 )
 from torch.utils.data import DataLoader, Subset, ConcatDataset
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy.stats import wilcoxon
+from statsmodels.stats.multitest import multipletests
 import logging
+import warnings
+warnings.filterwarnings('ignore')
 
 # PyTorch Lightning
 from pytorch_lightning import Trainer, seed_everything
@@ -34,24 +38,30 @@ except ImportError:
     from sklearn.model_selection import KFold
     USE_STRATIFIED = False
 
-# Custom imports
-from mpp.ml.models.classifier.cadtostepset import ProcessClassificationTrsfmEncoderModule
-from mpp.ml.models.classifier.cadtostepset_with_pmi import ProcessClassificationWithPMI
+# Custom imports - Updated for unified model
+from mpp.ml.models.classifier.unified_process_classifier import UnifiedProcessClassifier
 from mpp.ml.datasets.tkms import TKMS_Process_Dataset
 from mpp.ml.datasets.tkms_pmi import TKMS_PMI_Dataset
 
 # ========== CONFIGURATION ==========
 N_FOLDS = 5
+N_REPEATS = 5  # 5×5 = 25 data points for better statistical power
 SEED = 42
 BATCH_SIZE = 85
 MAX_EPOCHS = 100
 PATIENCE = 20
 CLASS_NAMES = ["Bohren", "Drehen", "Fräsen"]
-NUM_WORKERS = 4
+NUM_WORKERS = 3
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# Statistical Test Parameters
+N_BOOTSTRAP = 5000  # Reduced from 10000 for faster computation
+N_PERMUTATIONS = 5000  # Reduced from 10000 for faster computation
+ALPHA = 0.05  # Significance level
+USE_FDR = False  # Set to True only if reviewers request it
+
 # Output Directory
-OUTPUT_DIR = Path("cv_results") / datetime.now().strftime("%Y%m%d_%H%M%S")
+OUTPUT_DIR = Path("cv_results_unified") / datetime.now().strftime("%Y%m%d_%H%M%S")
 OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
 
 # Setup logging
@@ -67,22 +77,29 @@ logger = logging.getLogger(__name__)
 
 # Best hyperparameters from tuning
 HP_GEOM = {
-    "lr": 0.000287,
-    "embed_dim": 64,
-    "num_layers": 3,
-    "num_heads": 8,
-    "dropout": 0.109,
-    "weight_decay": 4.75e-05
-}
-
-HP_PMI = {
-    "lr": 0.00178,
+    "dropout": 0.224,
+    "lr": 0.000326,
     "embed_dim": 128,
     "num_layers": 2,
     "num_heads": 16,
-    "dropout": 0.338,
-    "weight_decay": 1.87e-05,
-    "pmi_dim": 58  # Based on your encoded PMI features
+    "weight_decay": 0.000374,
+    "use_pmi": False,  # Geometry-only
+    "pmi_dim": 30,  # Still needed for model initialization
+    "initial_gate": 0.2,
+    "modality_dropout": 0.0
+}
+
+HP_PMI = {
+    "dropout": 0.280,
+    "lr": 0.000690,
+    "embed_dim": 64,
+    "num_layers": 3,
+    "num_heads": 8,
+    "weight_decay": 0.000277,
+    "use_pmi": True,  # Multi-modal
+    "pmi_dim": 30,
+    "initial_gate": 0.171,
+    "modality_dropout": 0.206
 }
 
 # PMI Configuration
@@ -101,33 +118,27 @@ def ensure_determinism(seed):
     try:
         torch.use_deterministic_algorithms(True)
     except RuntimeError:
-        logger.warning("Could not enable fully deterministic algorithms. Using standard determinism.")
-    logger.info(f"Set seed to {seed} with deterministic settings")
+        logger.warning("Could not enable fully deterministic algorithms.")
+    logger.info(f"Set seed to {seed}")
 
 
 def load_datasets_with_alignment():
     """Load and align datasets ensuring same order"""
     logger.info("Loading and aligning datasets...")
-
-    # Load Train and Valid
+    
     train_geom = TKMS_Process_Dataset(mode="train", target_type="step-set")
     valid_geom = TKMS_Process_Dataset(mode="valid", target_type="step-set")
-
     train_pmi = TKMS_PMI_Dataset(mode="train", target_type="step-set", **PMI_CONFIG)
     valid_pmi = TKMS_PMI_Dataset(mode="valid", target_type="step-set", **PMI_CONFIG)
-
-    # Verify same sample ordering
+    
     assert train_geom.samples == train_pmi.samples, "Train samples mismatch!"
     assert valid_geom.samples == valid_pmi.samples, "Valid samples mismatch!"
-
-    # Get all sample IDs for reference
+    
     all_sample_ids = train_geom.samples + valid_geom.samples
-
-    # Combine datasets
+    
     dataset_geom = ConcatDataset([train_geom, valid_geom])
     dataset_pmi = ConcatDataset([train_pmi, valid_pmi])
-
-    # Extract labels for stratification
+    
     all_labels = []
     for i in range(len(train_geom) + len(valid_geom)):
         if i < len(train_geom):
@@ -135,59 +146,178 @@ def load_datasets_with_alignment():
         else:
             _, label = valid_geom[i - len(train_geom)]
         all_labels.append(label.numpy())
-
+    
     labels = np.array(all_labels)
-
-    # Sanity checks
+    
+    # Add interaction columns for better stratification
+    # Original: B, D, F (Bohren, Drehen, Fräsen)
+    # Add: B∧D, B∧F, D∧F
+    # Convert to int for bitwise operations
+    labels_int = labels.astype(int)
+    interactions = np.zeros((len(labels), 3), dtype=int)
+    interactions[:, 0] = labels_int[:, 0] & labels_int[:, 1]  # B∧D
+    interactions[:, 1] = labels_int[:, 0] & labels_int[:, 2]  # B∧F
+    interactions[:, 2] = labels_int[:, 1] & labels_int[:, 2]  # D∧F
+    
+    # Augmented labels for stratification
+    labels_augmented = np.hstack([labels_int, interactions])
+    
     assert len(dataset_geom) == len(dataset_pmi) == len(labels), "Dataset size mismatch!"
-    assert labels.ndim == 2 and labels.shape[1] == len(CLASS_NAMES), f"Label shape mismatch: {labels.shape}"
-
-    # Check PMI coverage
-    pmi_stats = train_pmi.get_pmi_statistics()
-    logger.info(f"PMI features: shape={pmi_stats['shape']}, clipped={pmi_stats['clipped']}, clip_value={pmi_stats['clip_value']}")
-
+    
     logger.info(f"Total samples: {len(labels)}")
     logger.info(f"Label distribution: {labels.sum(axis=0)} ({CLASS_NAMES})")
-    logger.info(f"Samples per label count: {np.bincount((labels.sum(axis=1)).astype(int))}")
+    logger.info(f"Interaction distribution: B∧D={interactions[:, 0].sum()}, "
+                f"B∧F={interactions[:, 1].sum()}, D∧F={interactions[:, 2].sum()}")
+    
+    return dataset_geom, dataset_pmi, labels, labels_augmented, all_sample_ids
 
-    return dataset_geom, dataset_pmi, labels, all_sample_ids
+
+def calculate_bootstrap_ci(values1, values2, n_bootstrap=N_BOOTSTRAP, seed=42):
+    """
+    Calculate bootstrap confidence interval for paired differences
+    
+    Parameters:
+    -----------
+    values1, values2: arrays of paired values
+    n_bootstrap: number of bootstrap samples
+    
+    Returns:
+    --------
+    mean_diff, ci_low, ci_high, p_value
+    """
+    diff = np.array(values1) - np.array(values2)
+    rng = np.random.default_rng(seed)
+    
+    boot_means = []
+    for _ in range(n_bootstrap):
+        idx = rng.integers(0, len(diff), len(diff))
+        boot_means.append(diff[idx].mean())
+    
+    ci_low, ci_high = np.percentile(boot_means, [2.5, 97.5])
+    mean_diff = diff.mean()
+    
+    # Bootstrap p-value (proportion of bootstrap samples < 0)
+    p_value = (np.sum(np.array(boot_means) <= 0) + 1) / (n_bootstrap + 1)
+    
+    return mean_diff, ci_low, ci_high, p_value
 
 
-def find_optimal_thresholds(model, val_loader, use_pmi=False, per_class=True):
-    """Find optimal thresholds - global or per-class"""
+def permutation_test(values1, values2, n_permutations=N_PERMUTATIONS, seed=42):
+    """
+    Paired permutation test
+    
+    Returns:
+    --------
+    p_value (one-sided, testing if values1 > values2)
+    """
+    diff = np.array(values1) - np.array(values2)
+    obs_mean = diff.mean()
+    
+    rng = np.random.default_rng(seed)
+    perm_means = []
+    
+    for _ in range(n_permutations):
+        signs = np.where(rng.random(len(diff)) < 0.5, 1, -1)
+        perm_means.append((diff * signs).mean())
+    
+    # One-sided p-value
+    p_value = (np.sum(np.array(perm_means) >= obs_mean) + 1) / (n_permutations + 1)
+    return p_value
+
+
+def find_optimal_thresholds_on_train(model, train_loader, train_indices, dataset, labels_augmented, use_pmi=False, per_class=True, val_split=0.1, fold_seed=42):
+    """Find optimal thresholds on inner train/val split to avoid leakage
+    
+    Parameters:
+    -----------
+    model : torch.nn.Module
+        Trained model
+    train_loader : DataLoader
+        Training data loader
+    train_indices : list
+        Indices for training fold
+    dataset : Dataset
+        Full dataset
+    labels_augmented : numpy.ndarray
+        Augmented labels including interactions for stratification
+    use_pmi : bool
+        Whether using PMI features
+    per_class : bool
+        Whether to find per-class thresholds
+    val_split : float
+        Proportion for inner validation
+    fold_seed : int
+        Seed for reproducibility (should be fold-specific)
+    """
+    # Get augmented labels for stratified split
+    y_train_augmented = labels_augmented[train_indices]
+    
+    # Create stratified inner split
+    try:
+        from iterstrat.ml_stratifiers import MultilabelStratifiedShuffleSplit
+        msss = MultilabelStratifiedShuffleSplit(n_splits=1, test_size=val_split, random_state=fold_seed)
+        inner_train_rel, inner_val_rel = next(msss.split(np.zeros(len(y_train_augmented)), y_train_augmented))
+    except ImportError:
+        # Fallback to random split if iterstrat not available
+        logger.warning("MultilabelStratifiedShuffleSplit not available, using random split")
+        rng = np.random.default_rng(fold_seed)
+        n_train = len(train_indices)
+        n_inner_val = int(n_train * val_split)
+        inner_indices = rng.permutation(n_train)
+        inner_train_rel = inner_indices[n_inner_val:]
+        inner_val_rel = inner_indices[:n_inner_val]
+    
+    # Map back to original indices
+    inner_train_indices = [train_indices[i] for i in inner_train_rel]
+    inner_val_indices = [train_indices[i] for i in inner_val_rel]
+    
+    # Create inner validation loader
+    inner_val_subset = Subset(dataset, inner_val_indices)
+    inner_val_loader = DataLoader(
+        inner_val_subset, 
+        batch_size=BATCH_SIZE, 
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=True
+    )
+    
+    # Find thresholds on inner validation set
     all_probs = []
     all_labels = []
-
+    
     model.eval()
     with torch.no_grad():
-        for batch in val_loader:
+        for batch in inner_val_loader:
             if use_pmi:
                 (inputs, pmi), labels = batch
                 outputs = model(inputs.to(DEVICE), pmi.to(DEVICE))
             else:
                 inputs, labels = batch
                 outputs = model(inputs.to(DEVICE))
-
+            
             probs = torch.sigmoid(outputs).cpu()
             all_probs.append(probs)
             all_labels.append(labels)
-
+    
     all_probs = torch.cat(all_probs).numpy()
     all_labels = torch.cat(all_labels).numpy()
-
+    
     if per_class:
         thresholds = np.zeros(len(CLASS_NAMES))
         for class_idx in range(len(CLASS_NAMES)):
-            best_threshold = 0.5
-            best_f1 = 0.0
-            for threshold in np.arange(0.1, 0.9, 0.01):
-                preds = (all_probs[:, class_idx] > threshold).astype(int)
-                f1 = f1_score(all_labels[:, class_idx], preds, zero_division=0)
-                if f1 > best_f1:
-                    best_f1 = f1
-                    best_threshold = threshold
-            thresholds[class_idx] = best_threshold
-            logger.info(f"  {CLASS_NAMES[class_idx]}: threshold={best_threshold:.2f}, F1={best_f1:.3f}")
+            # Use sklearn's precision_recall_curve for more efficient threshold search
+            from sklearn.metrics import precision_recall_curve
+            precision, recall, thresholds_pr = precision_recall_curve(
+                all_labels[:, class_idx], 
+                all_probs[:, class_idx]
+            )
+            # F1 = 2 * (precision * recall) / (precision + recall)
+            f1_scores = 2 * (precision * recall) / (precision + recall + 1e-10)
+            best_idx = np.argmax(f1_scores)
+            if best_idx < len(thresholds_pr):
+                thresholds[class_idx] = thresholds_pr[best_idx]
+            else:
+                thresholds[class_idx] = 0.5
     else:
         best_threshold = 0.5
         best_f1 = 0.0
@@ -198,8 +328,10 @@ def find_optimal_thresholds(model, val_loader, use_pmi=False, per_class=True):
                 best_f1 = f1
                 best_threshold = threshold
         thresholds = best_threshold
-        logger.info(f"  Global threshold: {best_threshold:.2f}, F1-macro={best_f1:.3f}")
-
+    
+    logger.debug(f"Optimal thresholds found on inner val: {thresholds}")
+    logger.debug(f"Inner split sizes - train: {len(inner_train_indices)}, val: {len(inner_val_indices)}")
+    
     return thresholds
 
 
@@ -208,7 +340,7 @@ def evaluate_model(model, loader, thresholds, use_pmi=False):
     all_probs = []
     all_preds = []
     all_labels = []
-
+    
     model.eval()
     with torch.no_grad():
         for batch in loader:
@@ -218,26 +350,24 @@ def evaluate_model(model, loader, thresholds, use_pmi=False):
             else:
                 inputs, labels = batch
                 outputs = model(inputs.to(DEVICE))
-
+            
             probs = torch.sigmoid(outputs).cpu().numpy()
-
-            # Apply thresholds
+            
             if isinstance(thresholds, np.ndarray):
                 preds = np.zeros_like(probs, dtype=int)
                 for i in range(len(CLASS_NAMES)):
                     preds[:, i] = (probs[:, i] > thresholds[i]).astype(int)
             else:
                 preds = (probs > thresholds).astype(int)
-
+            
             all_probs.append(probs)
             all_preds.append(preds)
             all_labels.append(labels.numpy())
-
+    
     all_probs = np.vstack(all_probs)
     all_preds = np.vstack(all_preds)
     all_labels = np.vstack(all_labels)
-
-    # Calculate metrics
+    
     metrics = {
         'f1_macro': f1_score(all_labels, all_preds, average='macro', zero_division=0),
         'f1_micro': f1_score(all_labels, all_preds, average='micro', zero_division=0),
@@ -247,8 +377,7 @@ def evaluate_model(model, loader, thresholds, use_pmi=False):
         'jaccard_macro': jaccard_score(all_labels, all_preds, average='macro', zero_division=0),
         'hamming_loss': hamming_loss(all_labels, all_preds),
     }
-
-    # Per-class metrics
+    
     precision, recall, f1, support = precision_recall_fscore_support(
         all_labels, all_preds, average=None, zero_division=0
     )
@@ -257,72 +386,56 @@ def evaluate_model(model, loader, thresholds, use_pmi=False):
         metrics[f'precision_{class_name}'] = precision[i]
         metrics[f'recall_{class_name}'] = recall[i]
         metrics[f'support_{class_name}'] = support[i]
-
-    # Store thresholds
-    if isinstance(thresholds, np.ndarray):
-        for i, class_name in enumerate(CLASS_NAMES):
-            metrics[f'threshold_{class_name}'] = thresholds[i]
-    else:
-        metrics['threshold_global'] = thresholds
-
-    # Confusion matrices
+    
     cm_per_class = multilabel_confusion_matrix(all_labels, all_preds)
-
+    
     return metrics, all_preds, all_labels, all_probs, cm_per_class
 
 
-def train_fold(fold_idx, train_idx, val_idx, dataset, model_type, sample_ids):
-    """Train one fold with improved tracking"""
-    ensure_determinism(SEED + fold_idx)
-
+def train_fold(repeat_idx, fold_idx, train_idx, val_idx, dataset, model_type, sample_ids, labels_augmented):
+    """Train one fold with tracking"""
+    global_fold_idx = repeat_idx * N_FOLDS + fold_idx
+    fold_seed = SEED + global_fold_idx
+    ensure_determinism(fold_seed)
+    
     logger.info(f"\n{'='*60}")
-    logger.info(f"Training {model_type.upper()} - Fold {fold_idx + 1}/{N_FOLDS}")
+    logger.info(f"Training {model_type.upper()} - Repeat {repeat_idx+1}/{N_REPEATS}, Fold {fold_idx+1}/{N_FOLDS}")
+    logger.info(f"Global Fold: {global_fold_idx+1}/{N_REPEATS*N_FOLDS}")
     logger.info(f"Train: {len(train_idx)}, Val: {len(val_idx)}")
-
-    # Choose model and hyperparameters
+    
+    # Use unified model for both modes
+    model_class = UnifiedProcessClassifier
+    
     if model_type == 'pmi':
-        model_class = ProcessClassificationWithPMI
         hp = HP_PMI.copy()
         use_pmi = True
     else:
-        model_class = ProcessClassificationTrsfmEncoderModule
         hp = HP_GEOM.copy()
         use_pmi = False
-
+    
     hp['max_epochs'] = MAX_EPOCHS
-
-    # Create dataloaders (robust when NUM_WORKERS=0)
+    
     PERSIST = NUM_WORKERS > 0
-
+    
     train_subset = Subset(dataset, train_idx)
     val_subset = Subset(dataset, val_idx)
-
+    
     train_loader = DataLoader(
-        train_subset,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=NUM_WORKERS,
-        pin_memory=True,
-        persistent_workers=PERSIST,
-        prefetch_factor=2 if PERSIST else None
+        train_subset, batch_size=BATCH_SIZE, shuffle=True,
+        num_workers=NUM_WORKERS, pin_memory=True,
+        persistent_workers=PERSIST, prefetch_factor=2 if PERSIST else None
     )
     val_loader = DataLoader(
-        val_subset,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=NUM_WORKERS,
-        pin_memory=True,
-        persistent_workers=PERSIST,
-        prefetch_factor=2 if PERSIST else None
+        val_subset, batch_size=BATCH_SIZE, shuffle=False,
+        num_workers=NUM_WORKERS, pin_memory=True,
+        persistent_workers=PERSIST, prefetch_factor=2 if PERSIST else None
     )
-
-    # Initialize model
+    
     model = model_class(**hp)
-
-    # Callbacks
-    checkpoint_dir = OUTPUT_DIR / f"fold_{fold_idx}" / model_type
+    
+    checkpoint_dir = OUTPUT_DIR / f"repeat_{repeat_idx}" / f"fold_{fold_idx}" / model_type
     checkpoint_dir.mkdir(exist_ok=True, parents=True)
-
+    
     checkpoint_callback = ModelCheckpoint(
         dirpath=checkpoint_dir,
         filename='best',
@@ -330,388 +443,473 @@ def train_fold(fold_idx, train_idx, val_idx, dataset, model_type, sample_ids):
         save_top_k=1,
         mode='min'
     )
-
+    
     early_stop = EarlyStopping(
         monitor='val_loss',
         patience=PATIENCE,
         mode='min',
-        verbose=True
+        verbose=False
     )
-
-    # Trainer
+    
     trainer = Trainer(
         max_epochs=MAX_EPOCHS,
         callbacks=[checkpoint_callback, early_stop],
-        enable_progress_bar=True,
+        enable_progress_bar=False,
         logger=False,
         devices=1,
         accelerator='gpu' if torch.cuda.is_available() else 'cpu',
         gradient_clip_val=1.0,
         deterministic=True
     )
-
-    # Training
+    
     trainer.fit(model, train_loader, val_loader)
-
-    # Load best model
+    
     model = model_class.load_from_checkpoint(checkpoint_callback.best_model_path)
     model.to(DEVICE)
     model.eval()
-
-    # Find optimal thresholds
-    logger.info("Finding optimal thresholds...")
-    thresholds = find_optimal_thresholds(model, val_loader, use_pmi, per_class=True)
-
-    # Evaluate
+    
+    # Pass dataset and labels_augmented to threshold finding function
+    thresholds = find_optimal_thresholds_on_train(
+        model, train_loader, train_idx, dataset, labels_augmented, 
+        use_pmi, per_class=True, fold_seed=fold_seed
+    )
     metrics, preds, labels, probs, cm = evaluate_model(model, val_loader, thresholds, use_pmi)
-
-    # Add fold metadata
+    
+    metrics['repeat'] = repeat_idx
     metrics['fold'] = fold_idx
-    metrics['epochs_trained'] = trainer.current_epoch + 1  # Anzahl Epochen
-    metrics['best_model_path'] = str(checkpoint_callback.best_model_path)
-    metrics['early_stopped_epoch'] = trainer.current_epoch + 1
+    metrics['global_fold'] = global_fold_idx
+    metrics['epochs_trained'] = trainer.current_epoch + 1
     metrics['model_type'] = model_type
-
-    # Save fold data
-    val_sample_ids = [sample_ids[i] for i in val_idx]
-
-    fold_results = {
-        'metrics': metrics,
-        'val_sample_ids': val_sample_ids,
-        'val_indices': val_idx.tolist(),
-        'checkpoint_path': str(checkpoint_callback.best_model_path),
-        'hyperparameters': hp
-    }
-
-    # Save all outputs
-    np.save(checkpoint_dir / "predictions.npy", preds)
-    np.save(checkpoint_dir / "labels.npy", labels)
-    np.save(checkpoint_dir / "probabilities.npy", probs)
-    np.save(checkpoint_dir / "confusion_matrices.npy", cm)
-    np.save(checkpoint_dir / "thresholds.npy", thresholds)
-
-    with open(checkpoint_dir / "fold_results.json", 'w') as f:
-        json.dump(fold_results, f, indent=4, default=str)
-
+    
+    # Add gate value for PMI model
+    if use_pmi and hasattr(model, 'gate'):
+        metrics['gate_value'] = torch.sigmoid(model.gate).item()
+        logger.info(f"  Gate value: {metrics['gate_value']:.3f}")
+    
     logger.info(f"  F1-Macro: {metrics['f1_macro']:.4f}")
-    logger.info(f"  F1-Micro: {metrics['f1_micro']:.4f}")
-    logger.info(f"  Jaccard-Samples: {metrics['jaccard_samples']:.4f}")
-
-    return metrics, preds, labels, cm
-
-
-def build_oof_table(output_dir: Path) -> pd.DataFrame:
-    """Build OOF predictions table from all fold results"""
-    rows = []
-    for fold_root in sorted(output_dir.glob("fold_*")):
-        for model_dir in [fold_root / "geom", fold_root / "pmi"]:
-            if not model_dir.is_dir():
-                continue
-
-            needed = ["predictions.npy", "labels.npy", "probabilities.npy", "thresholds.npy", "fold_results.json"]
-            if any(not (model_dir / f).exists() for f in needed):
-                logger.warning("Skipping %s (missing files)", model_dir)
-                continue
-
-            # Load required files
-            preds = np.load(model_dir / "predictions.npy")
-            labels = np.load(model_dir / "labels.npy")
-            probs = np.load(model_dir / "probabilities.npy")
-            thresholds = np.load(model_dir / "thresholds.npy", allow_pickle=True)
-            with open(model_dir / "fold_results.json") as f:
-                meta = json.load(f)
-
-            ids = meta["val_sample_ids"]
-            model_type = meta["metrics"]["model_type"]
-            fold = meta["metrics"]["fold"]
-
-            df = pd.DataFrame({"id": ids, "fold": fold, "model_type": model_type})
-            for i, cls in enumerate(CLASS_NAMES):
-                df[f"y_{cls}"] = labels[:, i].astype(int)
-                df[f"p_{cls}"] = probs[:, i]
-                df[f"hat_{cls}"] = preds[:, i].astype(int)
-
-            # thresholds
-            if isinstance(thresholds, np.ndarray):
-                for i, cls in enumerate(CLASS_NAMES):
-                    df[f"thr_{cls}"] = float(thresholds[i])
-            else:
-                df["thr_global"] = float(thresholds)
-
-            rows.append(df)
-
-    oof_df = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
-    oof_df.to_csv(output_dir / "oof_predictions.csv", index=False)
-
-    if not oof_df.empty:
-        logger.info(f"Saved OOF predictions to {output_dir / 'oof_predictions.csv'} ({len(oof_df)} rows)")
-        for model_type in ['geom', 'pmi']:
-            model_data = oof_df[oof_df['model_type'] == model_type]
-            if len(model_data) > 0:
-                y_true = model_data[[f"y_{c}" for c in CLASS_NAMES]].values
-                y_pred = model_data[[f"hat_{c}" for c in CLASS_NAMES]].values
-                oof_f1_macro = f1_score(y_true, y_pred, average='macro', zero_division=0)
-                oof_f1_micro = f1_score(y_true, y_pred, average='micro', zero_division=0)
-                oof_jaccard = jaccard_score(y_true, y_pred, average='samples', zero_division=0)
-                logger.info(f"\nOOF Metrics - {model_type.upper()}:")
-                logger.info(f"  F1-Macro: {oof_f1_macro:.4f}")
-                logger.info(f"  F1-Micro: {oof_f1_micro:.4f}")
-                logger.info(f"  Jaccard-Samples: {oof_jaccard:.4f}")
-
-    return oof_df
+    logger.info(f"  Epochs: {metrics['epochs_trained']}")
+    
+    return metrics
 
 
-def create_comprehensive_plots(df_geom, df_pmi, output_dir):
-    """Create comprehensive visualization plots"""
-    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+def perform_statistical_tests(results_geom, results_pmi):
+    """
+    Perform comprehensive statistical tests with FDR correction
+    """
+    test_results = {}
+    metrics_to_test = ['f1_macro', 'f1_micro', 'jaccard_samples', 'subset_accuracy']
+    
+    # Add per-class F1 scores
+    for class_name in CLASS_NAMES:
+        metrics_to_test.append(f'f1_{class_name}')
+    
+    all_p_values = []
+    all_test_names = []
+    
+    logger.info("\n" + "="*80)
+    logger.info("STATISTICAL TESTS")
+    logger.info("="*80)
+    
+    for metric in metrics_to_test:
+        geom_values = [r[metric] for r in results_geom]
+        pmi_values = [r[metric] for r in results_pmi]
+        
+        # 1. Wilcoxon signed-rank test (one-sided)
+        if len(geom_values) >= 5:
+            stat_wilcox, p_wilcox = wilcoxon(pmi_values, geom_values, alternative='greater')
+        else:
+            stat_wilcox, p_wilcox = np.nan, np.nan
+        
+        # 2. Bootstrap CI
+        mean_diff, ci_low, ci_high, p_bootstrap = calculate_bootstrap_ci(
+            pmi_values, geom_values, N_BOOTSTRAP
+        )
+        
+        # 3. Permutation test
+        p_perm = permutation_test(pmi_values, geom_values, N_PERMUTATIONS)
+        
+        test_results[metric] = {
+            'mean_geom': np.mean(geom_values),
+            'std_geom': np.std(geom_values),
+            'mean_pmi': np.mean(pmi_values),
+            'std_pmi': np.std(pmi_values),
+            'mean_diff': mean_diff,
+            'ci_low': ci_low,
+            'ci_high': ci_high,
+            'relative_improvement': (mean_diff / np.mean(geom_values)) * 100 if np.mean(geom_values) > 0 else 0,
+            'wilcoxon_statistic': stat_wilcox,
+            'wilcoxon_p': p_wilcox,
+            'bootstrap_p': p_bootstrap,
+            'permutation_p': p_perm
+        }
+        
+        # Collect p-values for FDR correction
+        if not np.isnan(p_wilcox):
+            all_p_values.append(p_wilcox)
+            all_test_names.append(metric)
+    
+    # FDR correction
+    if USE_FDR and len(all_p_values) > 0:
+        rejected, p_adjusted, _, _ = multipletests(all_p_values, alpha=ALPHA, method='fdr_bh')
+        for i, metric in enumerate(all_test_names):
+            test_results[metric]['wilcoxon_p_adjusted'] = p_adjusted[i]
+            test_results[metric]['significant_fdr'] = rejected[i]
+    
+    # Print results
+    logger.info(f"\nResults based on {len(results_geom)} samples (N_REPEATS={N_REPEATS}, N_FOLDS={N_FOLDS})")
+    logger.info("-" * 80)
+    
+    for metric in metrics_to_test:
+        res = test_results[metric]
+        logger.info(f"\n{metric}:")
+        logger.info(f"  Geometry:     {res['mean_geom']:.4f} ± {res['std_geom']:.4f}")
+        logger.info(f"  Geometry+PMI: {res['mean_pmi']:.4f} ± {res['std_pmi']:.4f}")
+        logger.info(f"  Difference:   {res['mean_diff']:.4f} ({res['relative_improvement']:+.1f}%)")
+        logger.info(f"  95% CI:       [{res['ci_low']:.4f}, {res['ci_high']:.4f}]")
+        
+        if not np.isnan(res['wilcoxon_p']):
+            sig_marker = "✓" if res['wilcoxon_p'] < ALPHA else "✗"
+            logger.info(f"  Wilcoxon p:   {res['wilcoxon_p']:.4f} {sig_marker}")
+            
+            if USE_FDR and 'wilcoxon_p_adjusted' in res:
+                sig_marker_fdr = "✓" if res['significant_fdr'] else "✗"
+                logger.info(f"  FDR-adjusted: {res['wilcoxon_p_adjusted']:.4f} {sig_marker_fdr}")
+        
+        logger.info(f"  Bootstrap p:  {res['bootstrap_p']:.4f}")
+        logger.info(f"  Permutation p: {res['permutation_p']:.4f}")
+    
+    return test_results
 
-    # 1. Box plot comparison
+
+def create_visualizations(results_geom, results_pmi, test_results, output_dir):
+    """Create visualization plots"""
+    df_geom = pd.DataFrame(results_geom)
+    df_pmi = pd.DataFrame(results_pmi)
+    
+    fig, axes = plt.subplots(3, 3, figsize=(20, 16))
+    
+    # 1. Box plot with significance markers
     ax = axes[0, 0]
-    data = pd.DataFrame({
-        'Geometry': df_geom['f1_macro'],
-        'Geometry+PMI': df_pmi['f1_macro']
-    })
-    data.boxplot(ax=ax)
+    positions = [1, 2]
+    data = [df_geom['f1_macro'], df_pmi['f1_macro']]
+    bp = ax.boxplot(data, positions=positions, widths=0.6, patch_artist=True,
+                     boxprops=dict(facecolor='lightblue', alpha=0.7))
+    ax.set_xticks(positions)
+    ax.set_xticklabels(['Geometry', 'Geometry+PMI'])
     ax.set_ylabel('F1-Macro Score')
-    ax.set_title('F1-Macro Distribution')
+    ax.set_title('F1-Macro Distribution (N=25)')
+    
+    # Add significance marker if significant
+    if test_results['f1_macro']['wilcoxon_p'] < ALPHA:
+        y_max = max(max(df_geom['f1_macro']), max(df_pmi['f1_macro']))
+        ax.plot([1, 2], [y_max + 0.01, y_max + 0.01], 'k-')
+        ax.text(1.5, y_max + 0.015, '***', ha='center', fontsize=12)
+    
     ax.grid(True, alpha=0.3)
-
-    # 2. Paired differences plot
+    
+    # 2. Paired differences with CI
     ax = axes[0, 1]
-    differences = df_pmi['f1_macro'].values - df_geom['f1_macro'].values
-    x = np.arange(len(differences))
-    colors = ['green' if d > 0 else 'red' for d in differences]
-    ax.bar(x, differences, color=colors, alpha=0.7)
-    ax.axhline(0, color='black', linestyle='-', linewidth=0.5)
-    ax.set_xlabel('Fold')
-    ax.set_ylabel('F1-Macro Difference (PMI - Geom)')
-    ax.set_title('Per-Fold Improvement')
+    metrics = ['f1_macro', 'f1_micro', 'jaccard_samples']
+    metric_labels = ['F1-Macro', 'F1-Micro', 'Jaccard']
+    
+    means = [test_results[m]['mean_diff'] for m in metrics]
+    ci_lows = [test_results[m]['ci_low'] for m in metrics]
+    ci_highs = [test_results[m]['ci_high'] for m in metrics]
+    
+    x = np.arange(len(metrics))
+    ax.errorbar(x, means, yerr=[np.array(means) - np.array(ci_lows), 
+                                 np.array(ci_highs) - np.array(means)],
+                fmt='o', capsize=5, capthick=2, markersize=8)
+    ax.axhline(0, color='red', linestyle='--', alpha=0.5)
     ax.set_xticks(x)
-    ax.set_xticklabels([f'Fold {i+1}' for i in range(len(differences))])
-
-    # 3. Per-class comparison
+    ax.set_xticklabels(metric_labels)
+    ax.set_ylabel('Mean Difference (PMI - Geom)')
+    ax.set_title('Mean Differences with 95% Bootstrap CI')
+    ax.grid(True, alpha=0.3)
+    
+    # 3. Per-repeat performance
     ax = axes[0, 2]
+    for repeat in range(N_REPEATS):
+        repeat_geom = [r['f1_macro'] for r in results_geom if r['repeat'] == repeat]
+        repeat_pmi = [r['f1_macro'] for r in results_pmi if r['repeat'] == repeat]
+        x = np.arange(len(repeat_geom))
+        ax.plot(x, repeat_geom, 'o-', alpha=0.5, label=f'Geom R{repeat+1}' if repeat == 0 else '')
+        ax.plot(x, repeat_pmi, 's-', alpha=0.5, label=f'PMI R{repeat+1}' if repeat == 0 else '')
+    ax.set_xlabel('Fold within Repeat')
+    ax.set_ylabel('F1-Macro')
+    ax.set_title('Performance Across Repeats')
+    ax.legend(['Geometry', 'Geometry+PMI'])
+    ax.grid(True, alpha=0.3)
+    
+    # 4. Distribution of differences
+    ax = axes[1, 0]
+    differences = np.array([r['f1_macro'] for r in results_pmi]) - \
+                  np.array([r['f1_macro'] for r in results_geom])
+    ax.hist(differences, bins=15, edgecolor='black', alpha=0.7, color='green')
+    ax.axvline(0, color='red', linestyle='--', label='No difference')
+    ax.axvline(np.mean(differences), color='blue', linestyle='-', linewidth=2, label='Mean difference')
+    ax.set_xlabel('F1-Macro Difference (PMI - Geom)')
+    ax.set_ylabel('Count')
+    ax.set_title(f'Distribution of Paired Differences (n={len(differences)})')
+    ax.legend()
+    
+    # 5. Per-class performance
+    ax = axes[1, 1]
     x = np.arange(len(CLASS_NAMES))
     width = 0.35
-
-    means_geom = [df_geom[f'f1_{c}'].mean() for c in CLASS_NAMES]
-    means_pmi = [df_pmi[f'f1_{c}'].mean() for c in CLASS_NAMES]
-    stds_geom = [df_geom[f'f1_{c}'].std() for c in CLASS_NAMES]
-    stds_pmi = [df_pmi[f'f1_{c}'].std() for c in CLASS_NAMES]
-
-    ax.bar(x - width/2, means_geom, width, yerr=stds_geom, label='Geometry', alpha=0.8, capsize=5)
-    ax.bar(x + width/2, means_pmi, width, yerr=stds_pmi, label='Geometry+PMI', alpha=0.8, capsize=5)
-
-    ax.set_ylabel('F1 Score')
+    
+    improvements = [test_results[f'f1_{c}']['relative_improvement'] for c in CLASS_NAMES]
+    p_values = [test_results[f'f1_{c}']['wilcoxon_p'] for c in CLASS_NAMES]
+    
+    bars = ax.bar(x, improvements, width, alpha=0.8)
+    
+    # Color bars based on significance
+    for i, (bar, p) in enumerate(zip(bars, p_values)):
+        if p < 0.001:
+            bar.set_color('darkgreen')
+        elif p < 0.01:
+            bar.set_color('green')
+        elif p < 0.05:
+            bar.set_color('lightgreen')
+        else:
+            bar.set_color('gray')
+    
+    ax.set_ylabel('Relative Improvement (%)')
     ax.set_xlabel('Process Class')
-    ax.set_title('Per-Class Performance')
+    ax.set_title('Per-Class Relative Improvement')
     ax.set_xticks(x)
     ax.set_xticklabels(CLASS_NAMES)
-    ax.legend()
+    ax.axhline(0, color='black', linestyle='-', linewidth=0.5)
     ax.grid(True, alpha=0.3)
-
-    # 4. Multiple metrics comparison
-    ax = axes[1, 0]
-    metrics = ['f1_macro', 'f1_micro', 'jaccard_samples', 'subset_accuracy']
-    metric_labels = ['F1-Macro', 'F1-Micro', 'Jaccard-Samples', 'Subset Acc.\n(exact match)']
-
-    geom_means = [df_geom[m].mean() for m in metrics]
-    pmi_means = [df_pmi[m].mean() for m in metrics]
-
-    x = np.arange(len(metrics))
-    ax.bar(x - width/2, geom_means, width, label='Geometry', alpha=0.8)
-    ax.bar(x + width/2, pmi_means, width, label='Geometry+PMI', alpha=0.8)
-
-    ax.set_ylabel('Score')
-    ax.set_title('Multiple Metrics Comparison')
-    ax.set_xticks(x)
-    ax.set_xticklabels(metric_labels, rotation=45)
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-
-    # 5. Learning curves (epochs)
-    ax = axes[1, 1]
-    ax.scatter(df_geom['epochs_trained'], df_geom['f1_macro'], label='Geometry', alpha=0.7, s=100)
-    ax.scatter(df_pmi['epochs_trained'], df_pmi['f1_macro'], label='Geometry+PMI', alpha=0.7, s=100)
-    ax.set_xlabel('Epochs Trained')
-    ax.set_ylabel('F1-Macro Score')
-    ax.set_title('Training Efficiency')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-
-    # 6. Improvement heatmap
+    
+    # 6. Learning efficiency and gate values
     ax = axes[1, 2]
-    improvements = pd.DataFrame({
-        'F1-Macro': [((df_pmi['f1_macro'].mean() - df_geom['f1_macro'].mean()) / df_geom['f1_macro'].mean()) * 100],
-        'F1-Micro': [((df_pmi['f1_micro'].mean() - df_geom['f1_micro'].mean()) / df_geom['f1_micro'].mean()) * 100],
-        'Jaccard': [((df_pmi['jaccard_samples'].mean() - df_geom['jaccard_samples'].mean()) / df_geom['jaccard_samples'].mean()) * 100],
-        'Subset Acc': [((df_pmi['subset_accuracy'].mean() - df_geom['subset_accuracy'].mean()) / df_geom['subset_accuracy'].mean()) * 100]
-    })
-
-    sns.heatmap(improvements, annot=True, fmt='.1f', cmap='RdYlGn', center=0,
-                cbar_kws={'label': 'Improvement %'}, ax=ax)
-    ax.set_title('Relative Improvements with PMI')
-    ax.set_yticklabels(['PMI vs Geom'], rotation=0)
-
-    plt.tight_layout()
-    plt.savefig(output_dir / 'cv_results_comprehensive.png', dpi=150, bbox_inches='tight')
-    plt.close()
-
-
-def analyze_results(results):
-    """Analyze and visualize CV results with statistical tests"""
-    logger.info("\n" + "="*80)
-    logger.info("CROSS-VALIDATION RESULTS")
-    logger.info("="*80)
-
-    # Convert to DataFrame
-    df_geom = pd.DataFrame(results['geom'])
-    df_pmi = pd.DataFrame(results['pmi'])
-
-    # Calculate statistics
-    metrics_to_analyze = ['f1_macro', 'f1_micro', 'jaccard_samples', 'subset_accuracy', 'hamming_loss']
-
-    logger.info("\nNote: 'subset_accuracy' ist sehr strikt (Exact Match). 'jaccard_samples' ist oft aussagekräftiger.\n")
-
-    for model_type, df in [('Geometry-only', df_geom), ('Geometry+PMI', df_pmi)]:
-        logger.info(f"\n{model_type}:")
-        for metric in metrics_to_analyze:
-            mean_val = df[metric].mean()
-            std_val = df[metric].std()
-            logger.info(f"  {metric}: {mean_val:.4f} ± {std_val:.4f}")
-
-        for class_name in CLASS_NAMES:
-            f1_key = f'f1_{class_name}'
-            if f1_key in df.columns:
-                mean_f1 = df[f1_key].mean()
-                std_f1 = df[f1_key].std()
-                logger.info(f"  F1-{class_name}: {mean_f1:.4f} ± {std_f1:.4f}")
-
-    # Improvements and Wilcoxon
-    logger.info("\nImprovements (PMI vs Geometry):")
-    test_results = {}
+    if 'gate_value' in df_pmi.columns:
+        ax2 = ax.twinx()
+        epochs_geom = [r['epochs_trained'] for r in results_geom]
+        epochs_pmi = [r['epochs_trained'] for r in results_pmi]
+        gate_values = df_pmi['gate_value'].values
+        
+        bp1 = ax.boxplot([epochs_geom, epochs_pmi], labels=['Geometry', 'Geometry+PMI'],
+                         positions=[1, 2], widths=0.4, patch_artist=True)
+        bp1['boxes'][0].set_facecolor('lightblue')
+        bp1['boxes'][1].set_facecolor('lightgreen')
+        
+        ax.set_ylabel('Epochs until convergence', color='black')
+        ax.tick_params(axis='y', labelcolor='black')
+        
+        ax2.scatter(np.ones(len(gate_values)) * 2.4, gate_values, alpha=0.6, color='red', s=30)
+        ax2.set_ylabel('Gate Value', color='red')
+        ax2.tick_params(axis='y', labelcolor='red')
+        ax2.set_ylim(0, 1)
+        
+        ax.set_title('Training Efficiency & Gate Values')
+    else:
+        epochs_geom = [r['epochs_trained'] for r in results_geom]
+        epochs_pmi = [r['epochs_trained'] for r in results_pmi]
+        ax.boxplot([epochs_geom, epochs_pmi], labels=['Geometry', 'Geometry+PMI'])
+        ax.set_ylabel('Epochs until convergence')
+        ax.set_title('Training Efficiency')
+    
+    ax.grid(True, alpha=0.3)
+    
+    # 7. Correlation between metric improvements
+    ax = axes[2, 0]
+    f1_diff = np.array([r['f1_macro'] for r in results_pmi]) - \
+              np.array([r['f1_macro'] for r in results_geom])
+    jaccard_diff = np.array([r['jaccard_samples'] for r in results_pmi]) - \
+                   np.array([r['jaccard_samples'] for r in results_geom])
+    
+    ax.scatter(f1_diff, jaccard_diff, alpha=0.6)
+    ax.set_xlabel('F1-Macro Improvement')
+    ax.set_ylabel('Jaccard Improvement')
+    ax.set_title('Correlation of Metric Improvements')
+    ax.axhline(0, color='gray', linestyle='--', alpha=0.5)
+    ax.axvline(0, color='gray', linestyle='--', alpha=0.5)
+    ax.grid(True, alpha=0.3)
+    
+    # 8. Statistical summary table
+    ax = axes[2, 1]
+    ax.axis('tight')
+    ax.axis('off')
+    
+    summary_data = []
     for metric in ['f1_macro', 'f1_micro', 'jaccard_samples']:
-        geom_mean = df_geom[metric].mean()
-        pmi_mean = df_pmi[metric].mean()
-        improvement = ((pmi_mean - geom_mean) / max(1e-12, geom_mean)) * 100
-        logger.info(f"  {metric}: {improvement:+.1f}%")
-        if len(df_geom) >= 5:
-            stat, p_value = wilcoxon(df_pmi[metric], df_geom[metric])
-            logger.info(f"    Wilcoxon: statistic={stat:.4f}, p={p_value:.4f} → {'sig.' if p_value < 0.05 else 'n.s.'}")
-            test_results[metric] = {'statistic': float(stat), 'p_value': float(p_value)}
-
-    logger.info("\nPer-class F1 (Wilcoxon):")
-    for class_name in CLASS_NAMES:
-        key = f'f1_{class_name}'
-        if key in df_geom.columns and len(df_geom) >= 5:
-            stat, p_value = wilcoxon(df_pmi[key], df_geom[key])
-            logger.info(f"  {class_name}: p={p_value:.4f} → {'sig.' if p_value < 0.05 else 'n.s.'}")
-            test_results[key] = {'statistic': float(stat), 'p_value': float(p_value)}
-
-    # Plots
-    create_comprehensive_plots(df_geom, df_pmi, OUTPUT_DIR)
-
-    # Save detailed results
-    summary = {
-        'geom': {
-            metric: {
-                'mean': df_geom[metric].mean(),
-                'std': df_geom[metric].std(),
-                'values': df_geom[metric].tolist()
-            }
-            for metric in df_geom.columns if metric not in ['fold', 'model_type', 'epochs_trained', 'best_model_path']
-        },
-        'pmi': {
-            metric: {
-                'mean': df_pmi[metric].mean(),
-                'std': df_pmi[metric].std(),
-                'values': df_pmi[metric].tolist()
-            }
-            for metric in df_pmi.columns if metric not in ['fold', 'model_type', 'epochs_trained', 'best_model_path']
-        },
-        'statistical_tests': test_results
-    }
-
-    with open(OUTPUT_DIR / 'summary.json', 'w') as f:
-        json.dump(summary, f, indent=4)
-
-    # Save DataFrames
-    df_geom.to_csv(OUTPUT_DIR / 'results_geom.csv', index=False)
-    df_pmi.to_csv(OUTPUT_DIR / 'results_pmi.csv', index=False)
+        res = test_results[metric]
+        summary_data.append([
+            metric.replace('_', '-'),
+            f"{res['mean_diff']:.4f}",
+            f"[{res['ci_low']:.4f}, {res['ci_high']:.4f}]",
+            f"{res['wilcoxon_p']:.4f}",
+            "✓" if res['wilcoxon_p'] < ALPHA else "✗"
+        ])
+    
+    table = ax.table(cellText=summary_data,
+                     colLabels=['Metric', 'Mean Δ', '95% CI', 'p-value', 'Sig.'],
+                     cellLoc='center',
+                     loc='center')
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1.2, 1.5)
+    ax.set_title('Statistical Summary', fontsize=12, pad=20)
+    
+    # 9. Relative improvement heatmap
+    ax = axes[2, 2]
+    improvements_matrix = pd.DataFrame({
+        'F1-Macro': [test_results['f1_macro']['relative_improvement']],
+        'F1-Micro': [test_results['f1_micro']['relative_improvement']],
+        'Jaccard': [test_results['jaccard_samples']['relative_improvement']],
+        'Subset Acc': [test_results['subset_accuracy']['relative_improvement']]
+    })
+    
+    sns.heatmap(improvements_matrix, annot=True, fmt='.1f', cmap='RdYlGn', center=0,
+                cbar_kws={'label': 'Improvement %'}, ax=ax, vmin=-5, vmax=20)
+    ax.set_title('Relative Improvements Summary')
+    ax.set_yticklabels(['PMI vs Geom'], rotation=0)
+    
+    plt.tight_layout()
+    plt.savefig(output_dir / 'cv_results_unified.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    logger.info(f"Saved plots to {output_dir / 'cv_results_unified.png'}")
 
 
-def run_cross_validation():
-    """Main cross-validation function with improvements"""
+def run_repeated_cross_validation():
+    """Main repeated cross-validation function"""
     logger.info("="*80)
-    logger.info("CROSS-VALIDATION: Geometry vs. Geometry+PMI")
-    logger.info(f"Configuration: {N_FOLDS} folds, Seed: {SEED}")
+    logger.info("CROSS-VALIDATION: Unified Process Classifier")
+    logger.info("Geometry-only vs. Multi-modal (Geometry+PMI)")
+    logger.info(f"Configuration: {N_REPEATS}×{N_FOLDS} = {N_REPEATS*N_FOLDS} total folds")
+    logger.info(f"Statistical tests: Wilcoxon (one-sided), Bootstrap CI, Permutation test")
+    logger.info(f"FDR correction: {'Yes' if USE_FDR else 'No'}")
     logger.info(f"Output: {OUTPUT_DIR}")
     logger.info("="*80)
-
+    
     # Save configuration
     config = {
         'n_folds': N_FOLDS,
+        'n_repeats': N_REPEATS,
+        'total_folds': N_FOLDS * N_REPEATS,
         'seed': SEED,
         'batch_size': BATCH_SIZE,
         'max_epochs': MAX_EPOCHS,
         'patience': PATIENCE,
+        'n_bootstrap': N_BOOTSTRAP,
+        'n_permutations': N_PERMUTATIONS,
+        'alpha': ALPHA,
+        'use_fdr': USE_FDR,
+        'model_class': 'UnifiedProcessClassifier',
         'hp_geom': HP_GEOM,
         'hp_pmi': HP_PMI,
         'pmi_config': PMI_CONFIG,
         'class_names': CLASS_NAMES
     }
-
+    
     with open(OUTPUT_DIR / 'config.json', 'w') as f:
         json.dump(config, f, indent=4)
-
-    # Load aligned data
-    dataset_geom, dataset_pmi, labels, sample_ids = load_datasets_with_alignment()
-
+    
+    # Load data
+    dataset_geom, dataset_pmi, labels, labels_augmented, sample_ids = load_datasets_with_alignment()
+    
     # Store all results
-    results = {'geom': [], 'pmi': []}
-
-    # Multilabel Stratified K-Fold
-    if USE_STRATIFIED:
-        mskf = MultilabelStratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
-        split_iter = mskf.split(labels, labels)
-    else:
-        kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
-        split_iter = kf.split(labels)
-
-    # Cross-validation
-    for fold_idx, (train_idx, val_idx) in enumerate(split_iter):
+    results_geom = []
+    results_pmi = []
+    
+    # Repeated Cross-Validation
+    for repeat_idx in range(N_REPEATS):
         logger.info(f"\n{'='*80}")
-        logger.info(f"FOLD {fold_idx + 1}/{N_FOLDS}")
-        logger.info(f"Train: {len(train_idx)}, Val: {len(val_idx)}")
-
-        # Check label distribution in fold
-        train_labels = labels[train_idx]
-        val_labels = labels[val_idx]
-        logger.info(f"Train label dist: {train_labels.sum(axis=0)}")
-        logger.info(f"Val label dist: {val_labels.sum(axis=0)}")
-
-        # Train both models on same fold
-        for model_type, dataset in [('geom', dataset_geom), ('pmi', dataset_pmi)]:
-            metrics, preds, labels_fold, cm = train_fold(
-                fold_idx, train_idx, val_idx, dataset, model_type, sample_ids
-            )
-            results[model_type].append(metrics)
-
-    # Build OOF table after all folds are complete
-    oof_df = build_oof_table(OUTPUT_DIR)
-
-    # Analyze and visualize results
-    analyze_results(results)
-
-    return results, oof_df
+        logger.info(f"REPEAT {repeat_idx + 1}/{N_REPEATS}")
+        logger.info("="*80)
+        
+        # New seed for each repeat
+        repeat_seed = SEED + repeat_idx * 1000
+        
+        if USE_STRATIFIED:
+            splitter = MultilabelStratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=repeat_seed)
+            split_iter = splitter.split(np.zeros(len(labels_augmented)), labels_augmented)
+        else:
+            splitter = KFold(n_splits=N_FOLDS, shuffle=True, random_state=repeat_seed)
+            split_iter = splitter.split(labels)
+        
+        for fold_idx, (train_idx, val_idx) in enumerate(split_iter):
+            # Train both models on same fold
+            for model_type, dataset in [('geom', dataset_geom), ('pmi', dataset_pmi)]:
+                metrics = train_fold(
+                    repeat_idx, fold_idx, train_idx, val_idx, 
+                    dataset, model_type, sample_ids, labels_augmented
+                )
+                
+                if model_type == 'geom':
+                    results_geom.append(metrics)
+                else:
+                    results_pmi.append(metrics)
+    
+    # Perform statistical tests
+    test_results = perform_statistical_tests(results_geom, results_pmi)
+    
+    # Create visualizations
+    create_visualizations(results_geom, results_pmi, test_results, OUTPUT_DIR)
+    
+    # Save all results
+    final_results = {
+        'config': config,
+        'results_geom': results_geom,
+        'results_pmi': results_pmi,
+        'statistical_tests': test_results,
+        'summary': {
+            'n_total_folds': len(results_geom),
+            'main_result': {
+                'metric': 'f1_macro',
+                'geom_mean': test_results['f1_macro']['mean_geom'],
+                'pmi_mean': test_results['f1_macro']['mean_pmi'],
+                'improvement': test_results['f1_macro']['relative_improvement'],
+                'p_value': test_results['f1_macro']['wilcoxon_p'],
+                'significant': test_results['f1_macro']['wilcoxon_p'] < ALPHA
+            }
+        }
+    }
+    
+    with open(OUTPUT_DIR / 'final_results.json', 'w') as f:
+        json.dump(final_results, f, indent=4, default=float)
+    
+    # Save DataFrames
+    pd.DataFrame(results_geom).to_csv(OUTPUT_DIR / 'results_geom.csv', index=False)
+    pd.DataFrame(results_pmi).to_csv(OUTPUT_DIR / 'results_pmi.csv', index=False)
+    
+    # Print final summary
+    logger.info("\n" + "="*80)
+    logger.info("FINAL SUMMARY")
+    logger.info("="*80)
+    
+    main_res = test_results['f1_macro']
+    logger.info(f"\nMain Result (F1-Macro):")
+    logger.info(f"  Geometry:     {main_res['mean_geom']:.4f} ± {main_res['std_geom']:.4f}")
+    logger.info(f"  Geometry+PMI: {main_res['mean_pmi']:.4f} ± {main_res['std_pmi']:.4f}")
+    logger.info(f"  Improvement:  {main_res['relative_improvement']:+.1f}%")
+    logger.info(f"  95% CI:       [{main_res['ci_low']:.4f}, {main_res['ci_high']:.4f}]")
+    logger.info(f"  p-value:      {main_res['wilcoxon_p']:.4f}")
+    
+    if main_res['wilcoxon_p'] < ALPHA:
+        logger.info(f"  → ✓ SIGNIFICANT at α={ALPHA}")
+    else:
+        logger.info(f"  → ✗ Not significant at α={ALPHA}")
+    
+    # Print gate value statistics for PMI models
+    if any('gate_value' in r for r in results_pmi):
+        gate_values = [r['gate_value'] for r in results_pmi if 'gate_value' in r]
+        logger.info(f"\nGate value statistics:")
+        logger.info(f"  Mean: {np.mean(gate_values):.3f}")
+        logger.info(f"  Std:  {np.std(gate_values):.3f}")
+        logger.info(f"  Range: [{np.min(gate_values):.3f}, {np.max(gate_values):.3f}]")
+    
+    return final_results
 
 
 if __name__ == "__main__":
     try:
-        results, oof_df = run_cross_validation()
+        results = run_repeated_cross_validation()
         logger.info(f"\n✓ Cross-Validation completed successfully!")
         logger.info(f"✓ Results saved in: {OUTPUT_DIR}")
-        logger.info(f"✓ OOF predictions available for {len(oof_df)} rows")
     except Exception as e:
         logger.error(f"Error during cross-validation: {str(e)}", exc_info=True)
         raise

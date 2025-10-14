@@ -82,6 +82,7 @@ class TKMS_Process_Dataset(Dataset):
     def split(self, train_size=0.8, valid_size=0.1, test_size=0.1):
         """
         Creates stratified splits based on manufacturing process distributions.
+        Ensures equal distribution of multi-label combinations across splits.
         
         Parameters
         ----------
@@ -97,24 +98,27 @@ class TKMS_Process_Dataset(Dataset):
         ValueError
             If the proportions do not sum to 1.0.
         """
+        import ast
         from sklearn.model_selection import train_test_split
         from datetime import datetime
+        from collections import Counter
         
         logger.info("Creating stratified splits for TKMS dataset...")
         
-        if train_size + valid_size + test_size != 1.0:
+        if abs(train_size + valid_size + test_size - 1.0) > 0.001:
             raise ValueError("train_size, valid_size and test_size must sum to 1.0")
         
-        # Get all available samples
-        all_samples = [path.stem for path in PATHS.TKMS_FEATURE_DATA.iterdir() 
-                    if path.stem != ".DS_Store" and path.is_dir()]
+        # Get all available samples (sorted for reproducibility)
+        all_samples = sorted([path.stem for path in PATHS.TKMS_FEATURE_DATA.iterdir() 
+                            if path.stem != ".DS_Store" and path.is_dir()])
         
-        # Load PMI data to get process labels for stratification
-        pmi_csv_path = Path("/workspace/masterthesis_cadtoplan_fabian_heinze/pmi_features.csv")
+        # Load PMI data for stratification
+        pmi_csv_path = Path("/workspace/masterthesis_cadtoplan_fabian_heinze/mpp/data_pmi/pmi_features.csv")
+        
         if not pmi_csv_path.exists():
             # Fallback to random split if PMI not available
             logger.warning("PMI data not found, falling back to random split")
-            np.random.seed(42)  # For reproducibility
+            np.random.seed(42)
             np.random.shuffle(all_samples)
             n_samples = len(all_samples)
             
@@ -125,52 +129,148 @@ class TKMS_Process_Dataset(Dataset):
             valid_samples = all_samples[train_end:valid_end]
             test_samples = all_samples[valid_end:]
         else:
-            # Stratified split based on processes
+            # Load PMI data
             pmi_df = pd.read_csv(pmi_csv_path)
             
-            # Filter samples that exist in PMI data
-            valid_samples = []
+            # Prepare samples and labels for stratification
+            labeled_samples = []  # Renamed from valid_samples to avoid confusion
             sample_labels = []
+            sample_multilabels = []
             
             for sample in all_samples:
-                if sample in pmi_df['part_name'].values:
-                    row = pmi_df[pmi_df['part_name'] == sample].iloc[0]
-                    processes = row.get('Processes', '')
+                # Handle _PMI suffix
+                sample_name = sample.replace('_PMI', '') if sample.endswith('_PMI') else sample
+                
+                if sample_name in pmi_df['part_name'].values:
+                    row = pmi_df[pmi_df['part_name'] == sample_name].iloc[0]
+                    processes_str = row.get('Processes', '[]')
                     
-                    # Create stratification label
-                    if pd.isna(processes) or processes == '':
-                        label = 'none'
+                    # Parse processes
+                    if pd.isna(processes_str) or processes_str == '[]' or processes_str == '':
+                        processes = []
                     else:
-                        # Use sorted process combination as label
-                        procs = sorted(str(processes).split(','))
-                        label = '_'.join(procs)
+                        try:
+                            processes = ast.literal_eval(processes_str)
+                        except:
+                            processes = []
                     
-                    valid_samples.append(sample)
-                    sample_labels.append(label)
+                    # Create binary label vector [bohren, drehen, fräsen]
+                    label_vector = [0, 0, 0]
+                    for proc in processes:
+                        if 'bohren' in proc.lower():
+                            label_vector[0] = 1
+                        elif 'drehen' in proc.lower():
+                            label_vector[1] = 1
+                        elif 'fräsen' in proc.lower() or 'fraesen' in proc.lower():
+                            label_vector[2] = 1
+                    
+                    # Create stratification label based on combination
+                    if sum(label_vector) == 0:
+                        strat_label = 'none'
+                    elif sum(label_vector) == 1:
+                        if label_vector[0]: strat_label = 'only_bohren'
+                        elif label_vector[1]: strat_label = 'only_drehen'
+                        else: strat_label = 'only_fraesen'
+                    elif sum(label_vector) == 2:
+                        if label_vector[0] and label_vector[1]: strat_label = 'bohren_drehen'
+                        elif label_vector[0] and label_vector[2]: strat_label = 'bohren_fraesen'
+                        else: strat_label = 'drehen_fraesen'
+                    else:
+                        strat_label = 'all_three'
+                    
+                    labeled_samples.append(sample)
+                    sample_labels.append(strat_label)
+                    sample_multilabels.append(label_vector)
             
-            if not valid_samples:
-                raise ValueError("No samples found in PMI data!")
+            logger.info(f"Using {len(labeled_samples)} samples with process labels for stratified split")
             
-            logger.info(f"Using {len(valid_samples)} samples with process labels for stratified split")
+            # Try multi-label stratification if available
+            try:
+                from iterstrat.ml_stratifiers import MultilabelStratifiedShuffleSplit
+                
+                # Convert to numpy array
+                y = np.array(sample_multilabels)
+                
+                # Add interaction features for better pair preservation (especially Drehen+Fräsen)
+                bd = (y[:, 0] & y[:, 1]).reshape(-1, 1)  # Bohren+Drehen
+                bf = (y[:, 0] & y[:, 2]).reshape(-1, 1)  # Bohren+Fräsen
+                df = (y[:, 1] & y[:, 2]).reshape(-1, 1)  # Drehen+Fräsen (important!)
+                y_aug = np.concatenate([y, bd, bf, df], axis=1)
+                
+                # First split: train+valid vs test
+                msss = MultilabelStratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=42)
+                train_val_idx, test_idx = next(msss.split(y_aug, y_aug))
+                
+                # Get samples for each split
+                train_val_samples = [labeled_samples[i] for i in train_val_idx]
+                test_samples = [labeled_samples[i] for i in test_idx]
+                
+                # Second split: train vs valid
+                y_train_val = y_aug[train_val_idx]
+                relative_val_size = valid_size / (train_size + valid_size)
+                msss2 = MultilabelStratifiedShuffleSplit(n_splits=1, test_size=relative_val_size, random_state=42)
+                train_idx_rel, val_idx_rel = next(msss2.split(y_train_val, y_train_val))
+                
+                train_samples = [train_val_samples[i] for i in train_idx_rel]
+                valid_samples = [train_val_samples[i] for i in val_idx_rel]
+                
+                logger.info("Using MultilabelStratifiedShuffleSplit for optimal distribution")
+                
+            except ImportError:
+                logger.warning("iterative-stratification not installed, using standard stratification")
+                logger.info("Install with: pip install iterative-stratification")
+                
+                # Standard stratified split based on combination labels
+                X_temp, test_samples, y_temp, _ = train_test_split(
+                    labeled_samples,
+                    sample_labels,
+                    test_size=test_size,
+                    stratify=sample_labels,
+                    random_state=42
+                )
+                
+                relative_val_size = valid_size / (train_size + valid_size)
+                train_samples, valid_samples, _, _ = train_test_split(
+                    X_temp,
+                    y_temp,
+                    test_size=relative_val_size,
+                    stratify=y_temp,
+                    random_state=42
+                )
+        
+        # Log distribution analysis
+        logger.info("\n" + "="*60)
+        logger.info("SPLIT DISTRIBUTION ANALYSIS")
+        logger.info("="*60)
+        
+        # Count combinations in each split
+        for split_name, samples_list in [('train', train_samples), ('valid', valid_samples), ('test', test_samples)]:
+            combo_counter = Counter()
             
-            # First split: train+valid vs test
-            X_temp, test_samples, y_temp, _ = train_test_split(
-                valid_samples,
-                sample_labels,
-                test_size=test_size,
-                stratify=sample_labels,
-                random_state=42
-            )
+            if pmi_csv_path.exists():
+                for sample in samples_list:
+                    sample_name = sample.replace('_PMI', '') if sample.endswith('_PMI') else sample
+                    if sample_name in pmi_df['part_name'].values:
+                        row = pmi_df[pmi_df['part_name'] == sample_name].iloc[0]
+                        processes_str = row.get('Processes', '[]')
+                        
+                        try:
+                            processes = ast.literal_eval(processes_str) if not pd.isna(processes_str) else []
+                        except:
+                            processes = []
+                        
+                        if not processes:
+                            combo_counter['none'] += 1
+                        elif len(processes) == 1:
+                            combo_counter[f'only_{processes[0]}'] += 1
+                        elif len(processes) == 2:
+                            combo_counter['+'.join(sorted(processes))] += 1
+                        else:
+                            combo_counter['all_three'] += 1
             
-            # Second split: train vs valid
-            relative_valid_size = valid_size / (train_size + valid_size)
-            train_samples, valid_samples, _, _ = train_test_split(
-                X_temp,
-                y_temp,
-                test_size=relative_valid_size,
-                stratify=y_temp,
-                random_state=42
-            )
+            logger.info(f"\n{split_name.upper()}: {len(samples_list)} samples")
+            for combo, count in combo_counter.most_common():
+                logger.info(f"  {combo}: {count} ({count/len(samples_list)*100:.1f}%)")
         
         # Create split dictionary
         split_dict = {
@@ -192,11 +292,12 @@ class TKMS_Process_Dataset(Dataset):
             
             logger.info(f"Backed up old splits to: {backup_name}")
         
-        # Save split dictionary to json file
+        # Save new split
         with open(split_file, "w") as f:
             json.dump(split_dict, f, indent=4)
         
-        logger.info(f"Split dataset into {len(train_samples)} train, {len(valid_samples)} validation and {len(test_samples)} test samples.")
+        logger.info(f"\nSplit dataset into {len(train_samples)} train, "
+                    f"{len(valid_samples)} validation and {len(test_samples)} test samples.")
         
         return None
 

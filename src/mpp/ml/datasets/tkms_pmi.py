@@ -53,7 +53,7 @@ class TKMS_PMI_Dataset(TKMS_Process_Dataset):
     def __init__(
         self,
         mode="train",
-        pmi_path="encoding_results/standard_encoding.npy",
+        pmi_path="/workspace/masterthesis_cadtoplan_fabian_heinze/mpp/encoding_results/standard_encoding.npy",
         pmi_csv_path=None,
         clip_value=None,
         transform=None,
