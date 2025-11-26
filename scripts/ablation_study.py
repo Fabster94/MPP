@@ -1,64 +1,59 @@
 #!/usr/bin/env python3
 """
-PMI Feature Ablation Study with Repeated Cross-Validation
-Uses mean-masking and focuses on WITHOUT_X ablations
-Includes FULL and GEOMETRY_ONLY controls for proper paired comparisons
+PMI Feature Ablation Study with Feature Removal and KEY_PMI Analysis
+Includes skip logic for already completed experiments
 """
 
+import os
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
+
 import numpy as np
-import torch
 import json
 from pathlib import Path
 from datetime import datetime
-from sklearn.metrics import f1_score, jaccard_score, accuracy_score, precision_recall_curve
-from torch.utils.data import DataLoader, Subset, ConcatDataset
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-from scipy.stats import wilcoxon
 import logging
 import warnings
-warnings.filterwarnings('ignore')
 
-# PyTorch Lightning
+import torch
+torch.use_deterministic_algorithms(True)
+torch.backends.cudnn.benchmark = False
+
+from sklearn.metrics import f1_score, jaccard_score, accuracy_score
+from torch.utils.data import DataLoader, Subset, ConcatDataset
+import pandas as pd
+from scipy.stats import wilcoxon
+
+warnings.filterwarnings('ignore', category=UserWarning)
+
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 
-# Setup logging early
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
 
-# Multilabel stratification - REQUIRED
-from iterstrat.ml_stratifiers import MultilabelStratifiedKFold, MultilabelStratifiedShuffleSplit
-
-# Custom imports
 from mpp.ml.models.classifier.unified_process_classifier import UnifiedProcessClassifier
 from mpp.ml.datasets.tkms import TKMS_Process_Dataset
 from mpp.ml.datasets.tkms_pmi import TKMS_PMI_Dataset
 
 # ========== CONFIGURATION ==========
 N_FOLDS = 5
-N_REPEATS = 5  # Match main CV
+N_REPEATS = 5
 SEED = 42
 BATCH_SIZE = 85
 MAX_EPOCHS = 100
 PATIENCE = 20
 CLASS_NAMES = ["Bohren", "Drehen", "Fräsen"]
-NUM_WORKERS = 3
+NUM_WORKERS = 3  # Faster data loading with multiple workers
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Statistical parameters
 N_BOOTSTRAP = 5000
 ALPHA = 0.05
 
-# Output Directory
-OUTPUT_DIR = Path("ablation_results_cv") / datetime.now().strftime("%Y%m%d_%H%M%S")
+# Path to your existing results
+PREVIOUS_RESULTS_PATH = Path("/workspace/masterthesis_cadtoplan_fabian_heinze/mpp/ablation_results_removal/20251020_164726/ablation_raw_results.json")
+
+OUTPUT_DIR = Path("ablation_results_removal") / datetime.now().strftime("%Y%m%d_%H%M%S")
 OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
 
-# Re-configure logging with file handler after output dir exists
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -66,11 +61,11 @@ logging.basicConfig(
         logging.FileHandler(str(OUTPUT_DIR / 'ablation_log.txt')),
         logging.StreamHandler()
     ],
-    force=True  # Override previous config
+    force=True
 )
 logger = logging.getLogger(__name__)
 
-# Best hyperparameters from main CV
+# Best hyperparameters from main CV - FIXED VERSION
 HP_GEOM = {
     "dropout": 0.224,
     "lr": 0.000326,
@@ -78,11 +73,10 @@ HP_GEOM = {
     "num_layers": 2,
     "num_heads": 16,
     "weight_decay": 0.000374,
-    "use_pmi": False,  # Geometry-only
-    "pmi_dim": 30,  # Still needed for model initialization
+    "use_pmi": False,
+    "pmi_dim": 30,
     "initial_gate": 0.2,
-    "modality_dropout": 0.0,
-    "max_epochs": MAX_EPOCHS
+    "modality_dropout": 0.0
 }
 
 HP_PMI = {
@@ -95,39 +89,22 @@ HP_PMI = {
     "use_pmi": True,
     "pmi_dim": 30,
     "initial_gate": 0.171,
-    "modality_dropout": 0.206,
-    "max_epochs": MAX_EPOCHS
+    "modality_dropout": 0.206
 }
 
-# PMI Configuration
-PMI_CONFIG = {
-    "pmi_path": "/workspace/masterthesis_cadtoplan_fabian_heinze/mpp/encoding_results/standard_encoding.npy",
-    "pmi_csv_path": "/workspace/masterthesis_cadtoplan_fabian_heinze/pmi_analyzer/data/raw/manufacturing_features_with_processes.csv",
-    "clip_value": 5.0
-}
-
-
-def ensure_determinism(seed):
-    """Ensure reproducible results"""
-    seed_everything(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    try:
-        torch.use_deterministic_algorithms(True)
-    except RuntimeError:
-        logger.warning("Could not enable fully deterministic algorithms.")
+PMI_CONFIG = {}
 
 
 def get_pmi_feature_groups():
-    """Define PMI feature groups with correct indices"""
-    # Feature groups based on your categorization
+    """Define PMI feature groups with CORRECT indices matching CSV column order"""
+    
     feature_groups = {
         'dimensions': [0, 1, 2, 3, 4],  # 5 features
-        'dimensional_tolerances': [5, 6, 7, 8, 9, 10, 11, 12, 13],  # 9 features
-        'geometric_tolerances': [14, 15, 16, 17, 18, 19, 20, 21],  # 8 features
-        'surface_finish': [22, 23, 24, 25],  # 4 features
-        'fits': [26, 27],  # 2 features
-        'datums': [28, 29]  # 2 features
+        'fits': [5, 6],  # 2 features
+        'dimensional_tolerances': [7, 8, 9, 10, 11, 12, 13, 14, 24],  # 9 features
+        'surface_finish': [15, 16, 17, 18],  # 4 features
+        'geometric_tolerances': [19, 20, 21, 22, 23, 27, 28, 29],  # 8 features
+        'datums': [25, 26]  # 2 features
     }
     
     # Verify all 30 features are covered
@@ -135,269 +112,96 @@ def get_pmi_feature_groups():
     for indices in feature_groups.values():
         all_indices.extend(indices)
     assert len(set(all_indices)) == 30, f"Feature mapping error: {len(set(all_indices))} != 30"
+    assert set(all_indices) == set(range(30)), "Not all indices 0-29 covered!"
     
-    logger.info("Feature groups defined:")
+    logger.info("Feature groups defined (CORRECTED):")
     for group, indices in feature_groups.items():
-        logger.info(f"  {group}: {len(indices)} features (indices {indices[0]}-{indices[-1]})")
+        logger.info(f"  {group}: {len(indices)} features (indices {min(indices)}-{max(indices)})")
     
     return feature_groups
 
 
-class PMI_Ablation_Dataset(TKMS_PMI_Dataset):
-    """Extended dataset with mean-masking for ablation"""
+class PMI_Removal_Dataset(TKMS_PMI_Dataset):
+    """Extended dataset with actual feature removal (not masking)"""
     
-    def __init__(self, mask_indices=None, *args, **kwargs):
+    def __init__(self, remove_indices=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.mask_indices = mask_indices if mask_indices is not None else []
+        self.remove_indices = remove_indices if remove_indices is not None else []
         
-        # Compute mean values for masking
-        if len(self.mask_indices) > 0:
-            self.mean_values = self.pmi_features.mean(dim=0)
-            logger.debug(f"Computed mean values for masking {len(self.mask_indices)} features")
+        # Create keep mask (inverse of remove)
+        self.keep_indices = [i for i in range(30) if i not in self.remove_indices]
+        self.output_dim = len(self.keep_indices)
+        
+        if len(self.remove_indices) > 0:
+            logger.debug(f"Removing {len(self.remove_indices)} features, keeping {self.output_dim}")
     
     def __getitem__(self, idx):
         # Get the original item from parent class
         (vecset, pmi_original), label = super().__getitem__(idx)
         
-        # Clone PMI features for masking
-        pmi_tensor = pmi_original.clone().float()
+        # Remove specified features
+        if len(self.remove_indices) > 0:
+            pmi_reduced = pmi_original[self.keep_indices].float()
+        else:
+            pmi_reduced = pmi_original.float()
         
-        # Apply mean-masking
-        if len(self.mask_indices) > 0:
-            pmi_tensor[self.mask_indices] = self.mean_values[self.mask_indices]
-        
-        return (vecset, pmi_tensor), label
+        return (vecset, pmi_reduced), label
 
 
-def find_optimal_thresholds_on_train(model, train_subset, dataset, labels_augmented, train_indices, use_pmi=True, per_class=True, val_split=0.1, fold_seed=42):
-    """Find optimal thresholds on inner train/val split to avoid leakage - matching CV script"""
-    # Get augmented labels for stratified split
-    y_train_augmented = labels_augmented[train_indices]
+def calculate_bootstrap_ci(data, n_bootstrap=N_BOOTSTRAP, alpha=ALPHA, seed=SEED):
+    """Calculate bootstrap confidence intervals with fixed RNG for reproducibility"""
+    if len(data) < 2:
+        return np.mean(data), np.nan, np.nan
     
-    # Create stratified inner split - always use MultilabelStratifiedShuffleSplit
-    msss = MultilabelStratifiedShuffleSplit(n_splits=1, test_size=val_split, random_state=fold_seed)
-    inner_train_rel, inner_val_rel = next(msss.split(np.zeros(len(y_train_augmented)), y_train_augmented))
-    
-    # Map back to original indices
-    inner_val_indices = [train_indices[i] for i in inner_val_rel]
-    
-    # Create inner validation loader
-    inner_val_subset = Subset(dataset, inner_val_indices)
-    inner_val_loader = DataLoader(
-        inner_val_subset, 
-        batch_size=BATCH_SIZE, 
-        shuffle=False,
-        num_workers=NUM_WORKERS,
-        pin_memory=True
-    )
-    
-    # Find thresholds on inner validation set
-    all_probs = []
-    all_labels = []
-    
-    model.eval()
-    with torch.no_grad():
-        for batch in inner_val_loader:
-            if use_pmi:
-                (inputs, pmi), labels = batch
-                outputs = model(inputs.to(DEVICE), pmi.to(DEVICE))
-            else:
-                inputs, labels = batch
-                outputs = model(inputs.to(DEVICE))
-            
-            probs = torch.sigmoid(outputs).cpu()
-            all_probs.append(probs)
-            all_labels.append(labels)
-    
-    all_probs = torch.cat(all_probs).numpy()
-    all_labels = torch.cat(all_labels).numpy()
-    
-    if per_class:
-        # Find per-class thresholds
-        thresholds = np.zeros(len(CLASS_NAMES))
-        for class_idx in range(len(CLASS_NAMES)):
-            precision, recall, thresholds_pr = precision_recall_curve(
-                all_labels[:, class_idx], 
-                all_probs[:, class_idx]
-            )
-            f1_scores = 2 * (precision * recall) / (precision + recall + 1e-10)
-            best_idx = np.argmax(f1_scores)
-            if best_idx < len(thresholds_pr):
-                thresholds[class_idx] = thresholds_pr[best_idx]
-            else:
-                thresholds[class_idx] = 0.5
-    else:
-        # Global threshold
-        best_threshold = 0.5
-        best_f1 = 0.0
-        for threshold in np.arange(0.1, 0.9, 0.01):
-            preds = (all_probs > threshold).astype(int)
-            f1 = f1_score(all_labels, preds, average='macro', zero_division=0)
-            if f1 > best_f1:
-                best_f1 = f1
-                best_threshold = threshold
-        thresholds = best_threshold
-    
-    logger.debug(f"Optimal thresholds found: {thresholds}")
-    return thresholds
-
-
-def calculate_bootstrap_ci(values, n_bootstrap=N_BOOTSTRAP, seed=42):
-    """Calculate bootstrap confidence interval for paired differences"""
     rng = np.random.default_rng(seed)
-    boot_means = []
-    
+    bootstrap_means = []
     for _ in range(n_bootstrap):
-        idx = rng.integers(0, len(values), len(values))
-        boot_means.append(values[idx].mean())
+        sample = rng.choice(data, size=len(data), replace=True)
+        bootstrap_means.append(np.mean(sample))
     
-    ci_low, ci_high = np.percentile(boot_means, [2.5, 97.5])
-    return values.mean(), ci_low, ci_high
+    lower = np.percentile(bootstrap_means, (alpha/2) * 100)
+    upper = np.percentile(bootstrap_means, (1 - alpha/2) * 100)
+    
+    return np.mean(data), lower, upper
 
 
-def train_ablation_fold(repeat_idx, fold_idx, train_idx, val_idx, dataset, labels_augmented, ablation_name, hyperparameters):
-    """Train one fold of ablation variant - matching CV script approach"""
-    global_fold_idx = repeat_idx * N_FOLDS + fold_idx
-    fold_seed = SEED + global_fold_idx
-    ensure_determinism(fold_seed)
-    
-    train_subset = Subset(dataset, train_idx)
-    val_subset = Subset(dataset, val_idx)
-    
-    train_loader = DataLoader(
-        train_subset, batch_size=BATCH_SIZE, shuffle=True,
-        num_workers=NUM_WORKERS, pin_memory=True
-    )
-    val_loader = DataLoader(
-        val_subset, batch_size=BATCH_SIZE, shuffle=False,
-        num_workers=NUM_WORKERS, pin_memory=True
-    )
-    
-    # Initialize model with specified hyperparameters
-    model = UnifiedProcessClassifier(**hyperparameters)
-    
-    # Setup training
-    checkpoint_dir = OUTPUT_DIR / f"repeat_{repeat_idx}" / f"fold_{fold_idx}" / ablation_name
-    checkpoint_dir.mkdir(exist_ok=True, parents=True)
-    
-    checkpoint_callback = ModelCheckpoint(
-        dirpath=checkpoint_dir,
-        filename='best',
-        monitor='val_loss',
-        save_top_k=1,
-        mode='min'
-    )
-    
-    early_stop = EarlyStopping(
-        monitor='val_loss',
-        patience=PATIENCE,
-        mode='min'
-    )
-    
-    trainer = Trainer(
-        max_epochs=MAX_EPOCHS,
-        callbacks=[checkpoint_callback, early_stop],
-        enable_progress_bar=True,  # Show training progress
-        logger=False,
-        devices=1,
-        accelerator='gpu' if torch.cuda.is_available() else 'cpu',
-        gradient_clip_val=1.0,
-        deterministic=True
-    )
-    
-    # Train
-    trainer.fit(model, train_loader, val_loader)
-    
-    # Load best model
-    model = UnifiedProcessClassifier.load_from_checkpoint(checkpoint_callback.best_model_path)
-    model.to(DEVICE)
-    model.eval()
-    
-    # Find optimal thresholds matching CV script approach
-    use_pmi = hyperparameters.get('use_pmi', True)
-    thresholds = find_optimal_thresholds_on_train(
-        model, train_subset, dataset, labels_augmented, train_idx,
-        use_pmi=use_pmi, per_class=True, fold_seed=fold_seed
-    )
-    
-    # Evaluate with optimal thresholds
-    all_preds = []
-    all_labels = []
-    
-    with torch.no_grad():
-        for batch in val_loader:
-            if use_pmi:
-                # PMI model expects tuple of (vecset, pmi)
-                (vecset, pmi), labels = batch
-                outputs = model(vecset.to(DEVICE), pmi.to(DEVICE))
-            else:
-                # Geometry-only model expects just vecset
-                vecset, labels = batch
-                outputs = model(vecset.to(DEVICE))
-            
-            probs = torch.sigmoid(outputs).cpu().numpy()
-            
-            # Apply per-class thresholds
-            if isinstance(thresholds, np.ndarray):
-                preds = np.zeros_like(probs, dtype=int)
-                for i in range(len(CLASS_NAMES)):
-                    preds[:, i] = (probs[:, i] > thresholds[i]).astype(int)
-            else:
-                preds = (probs > thresholds).astype(int)
-            
-            all_preds.append(preds)
-            all_labels.append(labels.numpy())
-    
-    all_preds = np.vstack(all_preds)
-    all_labels = np.vstack(all_labels)
-    
-    # Calculate metrics
-    metrics = {
-        'f1_macro': f1_score(all_labels, all_preds, average='macro', zero_division=0),
-        'f1_micro': f1_score(all_labels, all_preds, average='micro', zero_division=0),
-        'jaccard_samples': jaccard_score(all_labels, all_preds, average='samples', zero_division=0),
-        'subset_accuracy': accuracy_score(all_labels, all_preds),
-        'repeat': repeat_idx,
-        'fold': fold_idx,
-        'epochs_trained': trainer.current_epoch + 1,
-        'thresholds': thresholds.tolist() if isinstance(thresholds, np.ndarray) else [thresholds] * 3
-    }
-    
-    # Per-class metrics
-    f1_per_class = f1_score(all_labels, all_preds, average=None, zero_division=0)
-    for i, class_name in enumerate(CLASS_NAMES):
-        metrics[f'f1_{class_name.lower()}'] = f1_per_class[i]
-    
-    # Track gate value if available and PMI is used
-    if use_pmi and hasattr(model, 'gate'):
-        metrics['gate_value'] = torch.sigmoid(model.gate).item()
-    
-    return metrics
+def holm_adjust(pvals, alpha=ALPHA):
+    """Holm-Bonferroni multiple testing correction"""
+    p = np.array(pvals, dtype=float)
+    m = np.sum(~np.isnan(p))
+    order = np.argsort(np.where(np.isnan(p), np.inf, p))
+    adj = np.full_like(p, np.nan, dtype=float)
+    running_max = 0.0
+    k = 0
+    for idx in order:
+        if np.isnan(p[idx]): 
+            continue
+        adj_val = (m - k) * p[idx]
+        running_max = max(running_max, adj_val)
+        adj[idx] = min(running_max, 1.0)
+        k += 1
+    reject = adj < alpha
+    return adj, reject
 
 
 def load_aligned_datasets():
-    """Load and align datasets ensuring same order - matching CV script approach"""
-    logger.info("Loading and aligning datasets...")
-    
-    # Load geometry datasets (for GEOMETRY_ONLY)
+    """Load geometry and PMI datasets ensuring sample alignment"""
     train_geom = TKMS_Process_Dataset(mode="train", target_type="step-set")
     valid_geom = TKMS_Process_Dataset(mode="valid", target_type="step-set")
     
-    # Load PMI datasets (for FULL and WITHOUT_X)
     train_pmi = TKMS_PMI_Dataset(mode="train", target_type="step-set", **PMI_CONFIG)
     valid_pmi = TKMS_PMI_Dataset(mode="valid", target_type="step-set", **PMI_CONFIG)
     
-    # Verify sample order alignment
+    # Verify sample alignment
     assert train_pmi.samples == train_geom.samples, "Train sample order mismatch!"
     assert valid_pmi.samples == valid_geom.samples, "Valid sample order mismatch!"
     
     all_sample_ids = train_pmi.samples + valid_pmi.samples
     
-    # Create combined datasets
+    # Only geometry dataset is used for GEOMETRY_ONLY baseline
     dataset_geom = ConcatDataset([train_geom, valid_geom])
-    dataset_pmi = ConcatDataset([train_pmi, valid_pmi])
     
-    # Get labels for stratification (from either dataset, they're aligned)
+    # Get labels for stratification
     all_labels = []
     for i in range(len(train_geom) + len(valid_geom)):
         if i < len(train_geom):
@@ -410,15 +214,15 @@ def load_aligned_datasets():
     # Add interaction columns for better stratification
     labels_int = labels.astype(int)
     interactions = np.zeros((len(labels), 3), dtype=int)
-    interactions[:, 0] = labels_int[:, 0] & labels_int[:, 1]  # B∧D
-    interactions[:, 1] = labels_int[:, 0] & labels_int[:, 2]  # B∧F
-    interactions[:, 2] = labels_int[:, 1] & labels_int[:, 2]  # D∧F
+    interactions[:, 0] = labels_int[:, 0] & labels_int[:, 1]
+    interactions[:, 1] = labels_int[:, 0] & labels_int[:, 2]
+    interactions[:, 2] = labels_int[:, 1] & labels_int[:, 2]
     labels_augmented = np.hstack([labels_int, interactions])
     
     logger.info(f"Total samples: {len(labels)}")
     logger.info(f"Label distribution: {labels.sum(axis=0)} ({CLASS_NAMES})")
     
-    return dataset_geom, dataset_pmi, labels, labels_augmented, all_sample_ids
+    return dataset_geom, labels, labels_augmented, all_sample_ids
 
 
 def generate_all_splits(labels_augmented, n_repeats=N_REPEATS, n_folds=N_FOLDS, seed=SEED):
@@ -427,35 +231,196 @@ def generate_all_splits(labels_augmented, n_repeats=N_REPEATS, n_folds=N_FOLDS, 
     
     for repeat_idx in range(n_repeats):
         repeat_seed = seed + repeat_idx * 1000
-        
-        # Always use stratified splits - iterstrat is required
         splitter = MultilabelStratifiedKFold(n_splits=n_folds, shuffle=True, random_state=repeat_seed)
         splits = list(splitter.split(np.zeros(len(labels_augmented)), labels_augmented))
-        
         all_splits[repeat_idx] = splits
         logger.debug(f"Generated splits for repeat {repeat_idx}: {n_folds} folds")
     
     return all_splits
 
 
-def run_without_x_ablations():
-    """Run WITHOUT_X ablations with repeated CV including FULL and GEOMETRY_ONLY controls"""
+def train_ablation_fold(repeat_idx, fold_idx, train_idx, val_idx, dataset, 
+                        ablation_name, hyperparams, pmi_dim=30):
+    """Train single fold with specified configuration"""
+    fold_seed = SEED + repeat_idx * 1000 + fold_idx * 100
+    seed_everything(fold_seed, workers=True)
+    
+    use_pmi = (ablation_name != 'GEOMETRY_ONLY')
+    
+    # Log more details about current fold
+    logger.info(f"    Fold details: train={len(train_idx)} samples, val={len(val_idx)} samples")
+    logger.info(f"    Model config: {'PMI' if use_pmi else 'Geometry-only'}, pmi_dim={pmi_dim if use_pmi else 'N/A'}")
+    
+    train_subset = Subset(dataset, train_idx)
+    val_subset = Subset(dataset, val_idx)
+    
+    # Persistent workers for better performance (only if NUM_WORKERS > 0)
+    persistent = NUM_WORKERS > 0
+    
+    train_loader = DataLoader(
+        train_subset, 
+        batch_size=BATCH_SIZE, 
+        shuffle=True,
+        num_workers=NUM_WORKERS, 
+        pin_memory=True,
+        persistent_workers=persistent,
+        prefetch_factor=2 if persistent else None
+    )
+    val_loader = DataLoader(
+        val_subset, 
+        batch_size=BATCH_SIZE, 
+        shuffle=False,
+        num_workers=NUM_WORKERS, 
+        pin_memory=True,
+        persistent_workers=persistent,
+        prefetch_factor=2 if persistent else None
+    )
+    
+    # Build model parameters correctly
+    model_params = {
+        'num_classes': len(CLASS_NAMES),
+        **hyperparams  # This already includes use_pmi and all other params
+    }
+    
+    # Override pmi_dim for reduced models (when features are removed)
+    if use_pmi and pmi_dim != 30:
+        model_params['pmi_dim'] = pmi_dim
+    
+    model = UnifiedProcessClassifier(**model_params).to(DEVICE)
+    
+    checkpoint_dir = OUTPUT_DIR / f"repeat_{repeat_idx}" / f"fold_{fold_idx}" / ablation_name.lower()
+    checkpoint_dir.mkdir(exist_ok=True, parents=True)
+    
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=checkpoint_dir,
+        filename='best',
+        monitor='val_loss',
+        mode='min',
+        save_top_k=1
+    )
+    
+    early_stop_callback = EarlyStopping(
+        monitor='val_loss',
+        patience=PATIENCE,
+        mode='min',
+        verbose=True  # Show when early stopping triggers
+    )
+    
+    trainer = Trainer(
+        max_epochs=MAX_EPOCHS,
+        accelerator='gpu' if torch.cuda.is_available() else 'cpu',
+        devices=1,
+        callbacks=[checkpoint_callback, early_stop_callback],
+        enable_progress_bar=True,  # Show progress bar
+        logger=False,  # Keep False to avoid TensorBoard overhead
+        deterministic=True,
+        enable_model_summary=False  # Reduce clutter
+    )
+    
+    trainer.fit(model, train_loader, val_loader)
+    
+    # Load best model with correct parameters
+    checkpoint_params = {
+        'num_classes': len(CLASS_NAMES),
+        **hyperparams
+    }
+    
+    if use_pmi and pmi_dim != 30:
+        checkpoint_params['pmi_dim'] = pmi_dim
+    
+    best_model = UnifiedProcessClassifier.load_from_checkpoint(
+        checkpoint_callback.best_model_path,
+        **checkpoint_params
+    ).to(DEVICE)
+    
+    # Fixed threshold at 0.5 (no threshold tuning)
+    threshold = 0.5
+    
+    # Evaluate on validation set
+    all_preds = []
+    all_labels = []
+    all_probs = []
+    
+    best_model.eval()
+    with torch.no_grad():
+        for batch in val_loader:
+            if use_pmi:
+                (inputs, pmi), labels = batch
+                outputs = best_model(inputs.to(DEVICE), pmi.to(DEVICE))
+            else:
+                inputs, labels = batch
+                outputs = best_model(inputs.to(DEVICE))
+            
+            probs = torch.sigmoid(outputs).cpu().numpy()
+            preds = (probs >= threshold).astype(int)
+            
+            all_preds.append(preds)
+            all_labels.append(labels.numpy())
+            all_probs.append(probs)
+    
+    all_preds = np.vstack(all_preds)
+    all_labels = np.vstack(all_labels)
+    
+    f1_macro = f1_score(all_labels, all_preds, average='macro', zero_division=0)
+    f1_per_class = f1_score(all_labels, all_preds, average=None, zero_division=0)
+    jaccard = jaccard_score(all_labels, all_preds, average='macro', zero_division=0)
+    accuracy = accuracy_score(all_labels, all_preds)
+    
+    metrics = {
+        'f1_macro': f1_macro,
+        'f1_bohren': f1_per_class[0],
+        'f1_drehen': f1_per_class[1],
+        'f1_fraesen': f1_per_class[2],
+        'jaccard': jaccard,
+        'accuracy': accuracy,
+        'epochs_trained': trainer.current_epoch,
+        'threshold': threshold
+    }
+    
+    # Gate value for PMI models (robust handling)
+    if use_pmi and hasattr(best_model, 'gate'):
+        w = getattr(best_model.gate, 'weight', None)
+        if w is not None:
+            metrics['gate_value'] = torch.sigmoid(w).mean().item()
+    
+    # Log detailed results for this fold
+    logger.info(f"    Results: F1-Macro={f1_macro:.4f}, Epochs={trainer.current_epoch}")
+    logger.info(f"    Per-class F1: Bohren={f1_per_class[0]:.3f}, Drehen={f1_per_class[1]:.3f}, Fräsen={f1_per_class[2]:.3f}")
+    
+    return metrics
+
+
+def run_feature_removal_ablations():
+    """Run feature removal ablations with repeated CV"""
+    logger.info("\n" + "="*80)
+    logger.info("PMI FEATURE ABLATION STUDY - FEATURE REMOVAL ANALYSIS")
     logger.info("="*80)
-    logger.info("PMI FEATURE ABLATION STUDY - WITHOUT_X Analysis")
     logger.info(f"Configuration: {N_REPEATS}×{N_FOLDS} = {N_REPEATS*N_FOLDS} total folds")
+    logger.info(f"Batch size: {BATCH_SIZE}, Max epochs: {MAX_EPOCHS}, Patience: {PATIENCE}")
+    logger.info(f"Device: {DEVICE}")
     logger.info("="*80)
     
-    # Get feature groups
     feature_groups = get_pmi_feature_groups()
     
-    # Load aligned datasets (both geometry and PMI)
-    dataset_geom, dataset_pmi, labels, labels_augmented, sample_ids = load_aligned_datasets()
+    dataset_geom, labels, labels_augmented, sample_ids = load_aligned_datasets()
     
-    # Pre-generate all splits for perfect pairing
     logger.info("\nPre-generating CV splits for paired comparisons...")
     all_splits = generate_all_splits(labels_augmented)
     
-    # Save splits for reproducibility
+    # Check if previous results exist to skip completed experiments
+    if PREVIOUS_RESULTS_PATH.exists():
+        logger.info(f"\n⚠️  Loading existing results from: {PREVIOUS_RESULTS_PATH}")
+        with open(PREVIOUS_RESULTS_PATH, 'r') as f:
+            existing_data = json.load(f)
+            all_results = existing_data.get('results', {})
+        logger.info(f"   Loaded results for: {list(all_results.keys())}")
+        logger.info(f"   Number of folds per experiment: {len(all_results.get('GEOMETRY_ONLY', []))}")
+    else:
+        logger.info(f"\n⚠️  No previous results found at: {PREVIOUS_RESULTS_PATH}")
+        logger.info("   Starting fresh with all experiments...")
+        all_results = {}
+    
+    # Save splits with indices
     splits_for_save = {}
     for repeat_idx, splits in all_splits.items():
         splits_for_save[f"repeat_{repeat_idx}"] = [
@@ -464,120 +429,240 @@ def run_without_x_ablations():
         ]
     with open(OUTPUT_DIR / 'cv_splits.json', 'w') as f:
         json.dump(splits_for_save, f, indent=2)
+    
+    # Save splits with sample IDs for auditability
+    splits_for_save_ids = {}
+    for repeat_idx, splits in all_splits.items():
+        key = f"repeat_{repeat_idx}"
+        splits_for_save_ids[key] = []
+        for fold_idx, (train_idx, val_idx) in enumerate(splits):
+            splits_for_save_ids[key].append({
+                "fold": fold_idx,
+                "train_ids": [sample_ids[i] for i in train_idx],
+                "val_ids": [sample_ids[i] for i in val_idx],
+                "train_count": len(train_idx),
+                "val_count": len(val_idx)
+            })
+    with open(OUTPUT_DIR / 'cv_splits_ids.json', 'w') as f:
+        json.dump(splits_for_save_ids, f, indent=2)
+    
     logger.info(f"Saved CV splits to {OUTPUT_DIR / 'cv_splits.json'}")
+    logger.info(f"Saved CV split IDs to {OUTPUT_DIR / 'cv_splits_ids.json'}")
     
-    # Results storage
-    all_results = {}
+    # 1. GEOMETRY_ONLY baseline - SKIP if already done
+    if 'GEOMETRY_ONLY' not in all_results:
+        logger.info("\n" + "="*60)
+        logger.info("Running: GEOMETRY_ONLY (Baseline - No PMI)")
+        logger.info("Using TKMS_Process_Dataset with HP_GEOM hyperparameters")
+        logger.info("="*60)
+        
+        geom_results = []
+        for repeat_idx in range(N_REPEATS):
+            for fold_idx, (train_idx, val_idx) in enumerate(all_splits[repeat_idx]):
+                logger.info(f"\n  GEOMETRY_ONLY - Repeat {repeat_idx+1}/{N_REPEATS}, Fold {fold_idx+1}/{N_FOLDS}")
+                metrics = train_ablation_fold(
+                    repeat_idx, fold_idx, train_idx, val_idx, 
+                    dataset_geom, 'GEOMETRY_ONLY', HP_GEOM
+                )
+                geom_results.append(metrics)
+                logger.info(f"    → F1-Macro: {metrics['f1_macro']:.4f}, Epochs: {metrics['epochs_trained']}")
+        
+        all_results['GEOMETRY_ONLY'] = geom_results
+        
+        # Print summary for GEOMETRY_ONLY
+        geom_f1_array = np.array([r['f1_macro'] for r in geom_results])
+        logger.info(f"\n  GEOMETRY_ONLY Summary:")
+        logger.info(f"    Mean F1: {geom_f1_array.mean():.4f} ± {geom_f1_array.std():.4f}")
+        logger.info(f"    Min/Max: [{geom_f1_array.min():.4f}, {geom_f1_array.max():.4f}]")
+    else:
+        logger.info("\n✓ Skipping GEOMETRY_ONLY - already completed")
     
-    # 1. Run GEOMETRY_ONLY baseline using TKMS_Process_Dataset
-    logger.info("\n" + "="*60)
-    logger.info("Running: GEOMETRY_ONLY (Baseline - No PMI)")
-    logger.info("Using TKMS_Process_Dataset with HP_GEOM hyperparameters")
-    logger.info("="*60)
+    # 2. FULL control - SKIP if already done
+    if 'FULL' not in all_results:
+        logger.info("\n" + "="*60)
+        logger.info("Running: FULL (Control - All PMI Features)")
+        logger.info("Using PMI_Removal_Dataset with HP_PMI hyperparameters (no removal)")
+        logger.info("="*60)
+        
+        full_results = []
+        full_dataset = PMI_Removal_Dataset(
+            mode="train", target_type="step-set",
+            remove_indices=[],  # No features removed
+            **PMI_CONFIG
+        )
+        valid_dataset = PMI_Removal_Dataset(
+            mode="valid", target_type="step-set",
+            remove_indices=[],
+            **PMI_CONFIG
+        )
+        full_combined = ConcatDataset([full_dataset, valid_dataset])
+        
+        for repeat_idx in range(N_REPEATS):
+            for fold_idx, (train_idx, val_idx) in enumerate(all_splits[repeat_idx]):
+                logger.info(f"\n  FULL - Repeat {repeat_idx+1}/{N_REPEATS}, Fold {fold_idx+1}/{N_FOLDS}")
+                metrics = train_ablation_fold(
+                    repeat_idx, fold_idx, train_idx, val_idx, 
+                    full_combined, 'FULL', HP_PMI, pmi_dim=30
+                )
+                full_results.append(metrics)
+                gate_str = f", Gate: {metrics.get('gate_value', 'N/A'):.3f}" if 'gate_value' in metrics else ""
+                logger.info(f"    → F1-Macro: {metrics['f1_macro']:.4f}{gate_str}, Epochs: {metrics['epochs_trained']}")
+        
+        all_results['FULL'] = full_results
+        
+        # Print summary for FULL
+        full_f1_array = np.array([r['f1_macro'] for r in full_results])
+        logger.info(f"\n  FULL PMI Summary:")
+        logger.info(f"    Mean F1: {full_f1_array.mean():.4f} ± {full_f1_array.std():.4f}")
+        logger.info(f"    Min/Max: [{full_f1_array.min():.4f}, {full_f1_array.max():.4f}]")
+        logger.info(f"    Improvement over GEOMETRY: +{(full_f1_array.mean() - np.array([r['f1_macro'] for r in all_results['GEOMETRY_ONLY']]).mean()):.4f}")
+    else:
+        logger.info("\n✓ Skipping FULL - already completed")
     
-    geom_results = []
-    
-    for repeat_idx in range(N_REPEATS):
-        for fold_idx, (train_idx, val_idx) in enumerate(all_splits[repeat_idx]):
-            logger.info(f"  GEOMETRY_ONLY - Repeat {repeat_idx+1}/{N_REPEATS}, Fold {fold_idx+1}/{N_FOLDS}")
-            
-            metrics = train_ablation_fold(
-                repeat_idx, fold_idx, train_idx, val_idx, 
-                dataset_geom, labels_augmented, 'GEOMETRY_ONLY', HP_GEOM
-            )
-            geom_results.append(metrics)
-            logger.info(f"    F1-Macro: {metrics['f1_macro']:.4f}, Epochs: {metrics['epochs_trained']}")
-    
-    all_results['GEOMETRY_ONLY'] = geom_results
-    
-    # 2. Run FULL control condition using PMI_Ablation_Dataset (no masking)
-    logger.info("\n" + "="*60)
-    logger.info("Running: FULL (Control - All PMI Features)")
-    logger.info("Using PMI_Ablation_Dataset with HP_PMI hyperparameters")
-    logger.info("="*60)
-    
-    full_results = []
-    
-    # Create unmasked PMI dataset for FULL condition
-    full_dataset = PMI_Ablation_Dataset(
-        mode="train", target_type="step-set",
-        mask_indices=[],  # No masking
-        **PMI_CONFIG
-    )
-    valid_dataset = PMI_Ablation_Dataset(
-        mode="valid", target_type="step-set",
-        mask_indices=[],
-        **PMI_CONFIG
-    )
-    full_combined = ConcatDataset([full_dataset, valid_dataset])
-    
-    # Run FULL with pre-generated splits
-    for repeat_idx in range(N_REPEATS):
-        for fold_idx, (train_idx, val_idx) in enumerate(all_splits[repeat_idx]):
-            logger.info(f"  FULL - Repeat {repeat_idx+1}/{N_REPEATS}, Fold {fold_idx+1}/{N_FOLDS}")
-            
-            metrics = train_ablation_fold(
-                repeat_idx, fold_idx, train_idx, val_idx, 
-                full_combined, labels_augmented, 'FULL', HP_PMI
-            )
-            full_results.append(metrics)
-            gate_str = f", Gate: {metrics.get('gate_value', 'N/A'):.3f}" if 'gate_value' in metrics else ""
-            logger.info(f"    F1-Macro: {metrics['f1_macro']:.4f}{gate_str}")
-    
-    all_results['FULL'] = full_results
-    
-    # 3. Run WITHOUT_X ablations for each group using PMI_Ablation_Dataset with masking
-    for group_name, mask_indices in feature_groups.items():
+    # 3. WITHOUT_X ablations - SKIP already completed ones
+    for group_name, remove_indices in feature_groups.items():
         ablation_name = f'WITHOUT_{group_name}'
+        
+        if ablation_name in all_results:
+            logger.info(f"\n✓ Skipping {ablation_name} - already completed")
+            continue
+            
         logger.info(f"\n" + "="*60)
         logger.info(f"Running: {ablation_name}")
-        logger.info(f"Masking {len(mask_indices)} features: {mask_indices}")
-        logger.info("Using PMI_Ablation_Dataset with HP_PMI hyperparameters")
+        logger.info(f"Removing {len(remove_indices)} features: indices {remove_indices}")
+        logger.info(f"Resulting PMI dimension: {30 - len(remove_indices)}")
+        logger.info("Using PMI_Removal_Dataset with HP_PMI hyperparameters")
         logger.info("="*60)
         
         group_results = []
         
-        # Create masked dataset for this group
-        masked_train = PMI_Ablation_Dataset(
+        # Create dataset with features removed
+        removed_train = PMI_Removal_Dataset(
             mode="train", target_type="step-set",
-            mask_indices=mask_indices,
+            remove_indices=remove_indices,
             **PMI_CONFIG
         )
-        masked_valid = PMI_Ablation_Dataset(
+        removed_valid = PMI_Removal_Dataset(
             mode="valid", target_type="step-set",
-            mask_indices=mask_indices,
+            remove_indices=remove_indices,
             **PMI_CONFIG
         )
-        masked_combined = ConcatDataset([masked_train, masked_valid])
+        removed_combined = ConcatDataset([removed_train, removed_valid])
         
-        # Use same pre-generated splits
+        reduced_pmi_dim = 30 - len(remove_indices)
+        
         for repeat_idx in range(N_REPEATS):
             for fold_idx, (train_idx, val_idx) in enumerate(all_splits[repeat_idx]):
-                logger.info(f"  {ablation_name} - Repeat {repeat_idx+1}/{N_REPEATS}, Fold {fold_idx+1}/{N_FOLDS}")
-                
+                logger.info(f"\n  {ablation_name} - Repeat {repeat_idx+1}/{N_REPEATS}, Fold {fold_idx+1}/{N_FOLDS}")
                 metrics = train_ablation_fold(
                     repeat_idx, fold_idx, train_idx, val_idx, 
-                    masked_combined, labels_augmented, ablation_name, HP_PMI
+                    removed_combined, ablation_name, HP_PMI, 
+                    pmi_dim=reduced_pmi_dim
                 )
                 group_results.append(metrics)
-                logger.info(f"    F1-Macro: {metrics['f1_macro']:.4f}")
+                logger.info(f"    → F1-Macro: {metrics['f1_macro']:.4f}, Epochs: {metrics['epochs_trained']}")
         
         all_results[ablation_name] = group_results
+        
+        # Print summary for this ablation
+        without_f1_array = np.array([r['f1_macro'] for r in group_results])
+        logger.info(f"\n  {ablation_name} Summary:")
+        logger.info(f"    Mean F1: {without_f1_array.mean():.4f} ± {without_f1_array.std():.4f}")
+        logger.info(f"    Performance drop from FULL: -{(np.array([r['f1_macro'] for r in all_results['FULL']]).mean() - without_f1_array.mean()):.4f}")
     
-    # Save raw results with metadata
+    # 4. ONLY_KEY_PMI - NEW EXPERIMENT with only critical features
+    if 'ONLY_KEY_PMI' not in all_results:
+        logger.info("\n" + "="*60)
+        logger.info("🔑 Running: ONLY_KEY_PMI (Dimensions + Geometric Tolerances Only)")
+        logger.info("="*60)
+        
+        # Define key features to KEEP (dimensions + geometric_tolerances)
+        key_features_to_keep = [
+            0, 1, 2, 3, 4,  # dimensions (5 features)
+            19, 20, 21, 22, 23, 27, 28, 29  # geometric_tolerances (8 features)
+        ]
+        
+        # Convert to remove_indices (inverse logic for PMI_Removal_Dataset)
+        all_indices = set(range(30))
+        key_indices_set = set(key_features_to_keep)
+        remove_indices_for_key = sorted(list(all_indices - key_indices_set))
+        
+        logger.info(f"  Keeping {len(key_features_to_keep)} features: {sorted(key_features_to_keep)}")
+        logger.info(f"  Removing {len(remove_indices_for_key)} features: {remove_indices_for_key}")
+        logger.info(f"  Feature reduction: 30 → {len(key_features_to_keep)} (43% of original)")
+        logger.info(f"  Expected to capture ~76% of PMI benefit (based on ablation results)")
+        
+        key_results = []
+        
+        # Create dataset with only key features
+        key_train = PMI_Removal_Dataset(
+            mode="train", target_type="step-set",
+            remove_indices=remove_indices_for_key,
+            **PMI_CONFIG
+        )
+        key_valid = PMI_Removal_Dataset(
+            mode="valid", target_type="step-set",
+            remove_indices=remove_indices_for_key,
+            **PMI_CONFIG
+        )
+        key_combined = ConcatDataset([key_train, key_valid])
+        
+        key_pmi_dim = len(key_features_to_keep)  # 13
+        
+        for repeat_idx in range(N_REPEATS):
+            for fold_idx, (train_idx, val_idx) in enumerate(all_splits[repeat_idx]):
+                logger.info(f"\n  ONLY_KEY_PMI - Repeat {repeat_idx+1}/{N_REPEATS}, Fold {fold_idx+1}/{N_FOLDS}")
+                metrics = train_ablation_fold(
+                    repeat_idx, fold_idx, train_idx, val_idx,
+                    key_combined, 'ONLY_KEY_PMI', HP_PMI,
+                    pmi_dim=key_pmi_dim
+                )
+                key_results.append(metrics)
+                gate_str = f", Gate: {metrics.get('gate_value', 'N/A'):.3f}" if 'gate_value' in metrics else ""
+                logger.info(f"    → F1-Macro: {metrics['f1_macro']:.4f}{gate_str}, Epochs: {metrics['epochs_trained']}")
+        
+        all_results['ONLY_KEY_PMI'] = key_results
+        
+        # Print summary and comparison
+        key_f1_array = np.array([r['f1_macro'] for r in key_results])
+        logger.info(f"\n  🔑 ONLY_KEY_PMI Summary:")
+        logger.info(f"    Mean F1: {key_f1_array.mean():.4f} ± {key_f1_array.std():.4f}")
+        logger.info(f"    Min/Max: [{key_f1_array.min():.4f}, {key_f1_array.max():.4f}]")
+        
+        # Compare with baselines if available
+        if 'GEOMETRY_ONLY' in all_results and 'FULL' in all_results:
+            geom_mean = np.mean([r['f1_macro'] for r in all_results['GEOMETRY_ONLY']])
+            full_mean = np.mean([r['f1_macro'] for r in all_results['FULL']])
+            key_mean = key_f1_array.mean()
+            
+            total_gain = full_mean - geom_mean
+            key_gain = key_mean - geom_mean
+            efficiency = (key_gain / total_gain) * 100 if total_gain > 0 else 0
+            
+            logger.info(f"\n  📊 Feature Efficiency Analysis:")
+            logger.info(f"    GEOMETRY_ONLY:  {geom_mean:.4f}")
+            logger.info(f"    ONLY_KEY_PMI:   {key_mean:.4f} (+{key_gain:.4f})")
+            logger.info(f"    FULL_PMI:       {full_mean:.4f} (+{total_gain:.4f})")
+            logger.info(f"    → KEY features capture {efficiency:.1f}% of total PMI benefit")
+            logger.info(f"    → Using only 43% of PMI features!")
+    else:
+        logger.info("\n✓ Skipping ONLY_KEY_PMI - already completed")
+    
+    # Save results
     results_with_metadata = {
         'config': {
             'n_folds': N_FOLDS,
             'n_repeats': N_REPEATS,
             'seed': SEED,
             'stratification': 'MultilabelStratifiedKFold',
-            'masking_strategy': 'mean',
-            'threshold_tuning': 'inner_split_per_fold',
+            'ablation_strategy': 'feature_removal',
+            'threshold': 0.5,
+            'deterministic': True,
             'hp_geom': HP_GEOM,
             'hp_pmi': HP_PMI,
             'datasets': {
                 'geometry_only': 'TKMS_Process_Dataset',
-                'full_and_ablations': 'PMI_Ablation_Dataset'
+                'full_and_ablations': 'PMI_Removal_Dataset'
             }
         },
         'feature_groups': feature_groups,
@@ -587,16 +672,21 @@ def run_without_x_ablations():
     with open(OUTPUT_DIR / 'ablation_raw_results.json', 'w') as f:
         json.dump(results_with_metadata, f, indent=4, default=float)
     
-    # Analyze results with proper paired comparisons
     analysis_results = analyze_paired_results(all_results, feature_groups)
     
     return all_results, analysis_results
 
 
 def analyze_paired_results(results, feature_groups):
-    """Analyze WITH proper paired comparisons including geometry baseline"""
+    """Analyze with proper paired comparisons including ONLY_KEY_PMI"""
     
-    # Extract results for all conditions
+    # Explicit class key mapping (handles umlauts correctly)
+    CLASS_KEY_MAP = {
+        "Bohren": "f1_bohren",
+        "Drehen": "f1_drehen",
+        "Fräsen": "f1_fraesen",  # ae not ä
+    }
+    
     geom_results = results['GEOMETRY_ONLY']
     full_results = results['FULL']
     
@@ -607,284 +697,206 @@ def analyze_paired_results(results, feature_groups):
     logger.info("ABLATION ANALYSIS SUMMARY (Paired Comparisons)")
     logger.info("="*80)
     
-    # Report both baselines
-    logger.info(f"\nGEOMETRY_ONLY Performance (this run):")
-    logger.info(f"  Mean F1-Macro: {geom_f1_per_fold.mean():.4f} ± {geom_f1_per_fold.std():.4f}")
-    logger.info(f"  Min/Max: [{geom_f1_per_fold.min():.4f}, {geom_f1_per_fold.max():.4f}]")
+    logger.info(f"\n📊 BASELINE PERFORMANCE:")
+    logger.info(f"  GEOMETRY_ONLY: {geom_f1_per_fold.mean():.4f} ± {geom_f1_per_fold.std():.4f}")
+    logger.info(f"  FULL PMI:      {full_f1_per_fold.mean():.4f} ± {full_f1_per_fold.std():.4f}")
     
-    logger.info(f"\nFULL PMI Performance (this run):")
-    logger.info(f"  Mean F1-Macro: {full_f1_per_fold.mean():.4f} ± {full_f1_per_fold.std():.4f}")
-    logger.info(f"  Min/Max: [{full_f1_per_fold.min():.4f}, {full_f1_per_fold.max():.4f}]")
+    total_pmi_gain = max(full_f1_per_fold.mean() - geom_f1_per_fold.mean(), 1e-8)
     
-    # Calculate total PMI gain from this run's actual results
-    total_pmi_gain_measured = full_f1_per_fold.mean() - geom_f1_per_fold.mean()
+    logger.info(f"\n📈 TOTAL PMI CONTRIBUTION: +{total_pmi_gain:.4f}")
+    logger.info(f"  Relative improvement: {(total_pmi_gain / geom_f1_per_fold.mean() * 100):.1f}%")
     
-    # Ensure we have a positive gain for relative calculations
-    total_pmi_gain = max(total_pmi_gain_measured, 1e-8)
-    
-    logger.info(f"\nTotal PMI gain (measured in this run):")
-    logger.info(f"  Gain: {total_pmi_gain_measured:.4f}")
-    logger.info(f"  Geometry mean: {geom_f1_per_fold.mean():.4f}")
-    logger.info(f"  Full PMI mean: {full_f1_per_fold.mean():.4f}")
-    
-    # Analyze each group with paired comparisons
     analysis_df = []
     
+    # Analyze WITHOUT_X groups
     for group_name in feature_groups.keys():
-        without_results = results[f'WITHOUT_{group_name}']
+        without_results = results.get(f'WITHOUT_{group_name}')
+        if not without_results:
+            continue
+            
         without_f1_per_fold = np.array([r['f1_macro'] for r in without_results])
         
-        # Paired differences (same fold indices)
+        # Paired differences
         paired_deltas = full_f1_per_fold - without_f1_per_fold
         
-        # Bootstrap CI on paired differences
+        # Bootstrap CI
         drop_mean, drop_ci_low, drop_ci_high = calculate_bootstrap_ci(paired_deltas)
         
-        # Wilcoxon signed-rank test (one-sided: drop > 0)
+        # Wilcoxon test
         if len(paired_deltas) >= 5:
             stat_wilcox, p_wilcox = wilcoxon(paired_deltas, alternative='greater')
         else:
             stat_wilcox, p_wilcox = np.nan, np.nan
         
-        # Per-class analysis (also paired)
+        # Per-class analysis - USE THE MAP
         per_class_drops = {}
         for class_name in CLASS_NAMES:
-            class_key = f'f1_{class_name.lower()}'
+            class_key = CLASS_KEY_MAP[class_name]
             full_class = np.array([r[class_key] for r in full_results])
             without_class = np.array([r[class_key] for r in without_results])
             per_class_drops[class_name] = (full_class - without_class).mean()
         
-        # Gate value analysis if available
+        # Gate values
         gate_values = [r.get('gate_value', np.nan) for r in without_results]
         mean_gate = np.nanmean(gate_values) if any(~np.isnan(gate_values)) else np.nan
         
         analysis_df.append({
             'Group': group_name,
-            'F1_WITHOUT_mean': without_f1_per_fold.mean(),
-            'F1_WITHOUT_std': without_f1_per_fold.std(),
+            'Type': 'WITHOUT',
+            'F1_mean': without_f1_per_fold.mean(),
+            'F1_std': without_f1_per_fold.std(),
             'Performance_Drop': drop_mean,
             'Drop_CI_Low': drop_ci_low,
             'Drop_CI_High': drop_ci_high,
+            'Relative_Importance_%': (drop_mean / total_pmi_gain) * 100,
             'Wilcoxon_statistic': stat_wilcox,
             'Wilcoxon_p': p_wilcox,
             'Significant': p_wilcox < ALPHA if not np.isnan(p_wilcox) else False,
-            'Relative_Importance_%': (drop_mean / total_pmi_gain * 100) if total_pmi_gain > 0 else 0,
             'Drop_Bohren': per_class_drops['Bohren'],
             'Drop_Drehen': per_class_drops['Drehen'],
             'Drop_Fraesen': per_class_drops['Fräsen'],
-            'Mean_Gate': mean_gate
+            'Mean_Gate_Value': mean_gate
         })
+    
+    # Add ONLY_KEY_PMI analysis if available
+    if 'ONLY_KEY_PMI' in results:
+        key_results = results['ONLY_KEY_PMI']
+        key_f1_per_fold = np.array([r['f1_macro'] for r in key_results])
         
-        logger.info(f"\n{group_name}:")
-        logger.info(f"  F1 WITHOUT: {without_f1_per_fold.mean():.4f} ± {without_f1_per_fold.std():.4f}")
-        logger.info(f"  Paired Drop: {drop_mean:.4f} [{drop_ci_low:.4f}, {drop_ci_high:.4f}]")
-        logger.info(f"  Wilcoxon p: {p_wilcox:.4f} {'✓' if p_wilcox < ALPHA else '✗'}")
-        logger.info(f"  Importance: {drop_mean/total_pmi_gain*100:.1f}% of total PMI gain")
-        logger.info(f"  Per-class drops: B={per_class_drops['Bohren']:.3f}, "
-                   f"D={per_class_drops['Drehen']:.3f}, F={per_class_drops['Fräsen']:.3f}")
-        if not np.isnan(mean_gate):
-            logger.info(f"  Mean gate value: {mean_gate:.3f}")
+        # Compare with GEOMETRY baseline
+        key_vs_geom = key_f1_per_fold - geom_f1_per_fold
+        key_gain_mean, key_gain_ci_low, key_gain_ci_high = calculate_bootstrap_ci(key_vs_geom)
+        
+        # Wilcoxon test vs geometry
+        if len(key_vs_geom) >= 5:
+            stat_wilcox, p_wilcox = wilcoxon(key_vs_geom, alternative='greater')
+        else:
+            stat_wilcox, p_wilcox = np.nan, np.nan
+        
+        # Efficiency calculation
+        efficiency = (key_gain_mean / total_pmi_gain) * 100 if total_pmi_gain > 0 else 0
+        
+        analysis_df.append({
+            'Group': 'KEY_PMI (Dim+GeoTol)',
+            'Type': 'ONLY',
+            'F1_mean': key_f1_per_fold.mean(),
+            'F1_std': key_f1_per_fold.std(),
+            'Performance_Drop': -(key_gain_mean),  # Negative because it's a gain
+            'Drop_CI_Low': -(key_gain_ci_high),  # Inverted for gain
+            'Drop_CI_High': -(key_gain_ci_low),
+            'Relative_Importance_%': efficiency,
+            'Wilcoxon_statistic': stat_wilcox,
+            'Wilcoxon_p': p_wilcox,
+            'Significant': p_wilcox < ALPHA if not np.isnan(p_wilcox) else False,
+            'Drop_Bohren': np.nan,  # Not applicable for ONLY
+            'Drop_Drehen': np.nan,
+            'Drop_Fraesen': np.nan,
+            'Mean_Gate_Value': np.nanmean([r.get('gate_value', np.nan) for r in key_results])
+        })
     
-    # Create DataFrame and sort by importance
-    df = pd.DataFrame(analysis_df).sort_values('Performance_Drop', ascending=False)
-    df.to_csv(OUTPUT_DIR / 'ablation_analysis_paired.csv', index=False)
+    df = pd.DataFrame(analysis_df)
     
-    # Create enhanced visualizations including geometry baseline
-    create_enhanced_ablation_plots(df, geom_f1_per_fold, full_f1_per_fold, results, feature_groups, OUTPUT_DIR)
+    # Separate WITHOUT and ONLY analyses
+    df_without = df[df['Type'] == 'WITHOUT'].sort_values('Performance_Drop', ascending=False)
     
-    # Print final ranking
-    logger.info("\n" + "="*80)
-    logger.info("FEATURE GROUP IMPORTANCE RANKING (Paired Analysis)")
-    logger.info("="*80)
-    for idx, row in df.iterrows():
-        sig_marker = "✓" if row['Significant'] else ""
-        logger.info(f"{idx+1}. {row['Group']:25s}: "
-                   f"Drop={row['Performance_Drop']:.4f} "
-                   f"({row['Relative_Importance_%']:.1f}%) "
-                   f"p={row['Wilcoxon_p']:.3f} {sig_marker}")
+    # Apply Holm-Bonferroni multiple testing correction only to WITHOUT comparisons
+    if len(df_without) > 0:
+        adj_pvals, reject = holm_adjust(df_without['Wilcoxon_p'].values)
+        df_without['p_holm'] = adj_pvals
+        df_without['Significant'] = reject
     
-    # Calculate and report gate correlation if available
-    if not df['Mean_Gate'].isna().all():
-        from scipy.stats import pearsonr
-        valid_gates = df.dropna(subset=['Mean_Gate'])
-        if len(valid_gates) > 2:
-            corr, p_corr = pearsonr(valid_gates['Performance_Drop'], valid_gates['Mean_Gate'])
-            logger.info(f"\nGate-Importance Correlation: r={corr:.3f}, p={p_corr:.3f}")
+    # Combine back
+    df_final = pd.concat([df_without, df[df['Type'] == 'ONLY']], ignore_index=True)
     
-    return df
-
-
-def create_enhanced_ablation_plots(df, geom_f1, full_f1, results, feature_groups, output_dir):
-    """Create publication-ready ablation plots including geometry baseline"""
+    # Save analysis with timestamp
+    df_final.to_csv(OUTPUT_DIR / 'ablation_analysis.csv', index=False)
+    logger.info(f"\nAnalysis saved to {OUTPUT_DIR / 'ablation_analysis.csv'}")
     
-    fig, axes = plt.subplots(2, 3, figsize=(16, 10))
+    # Also save a summary report
+    with open(OUTPUT_DIR / 'summary_report.txt', 'w') as f:
+        f.write("="*80 + "\n")
+        f.write("ABLATION STUDY SUMMARY REPORT\n")
+        f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("="*80 + "\n\n")
+        
+        f.write("BASELINE PERFORMANCE:\n")
+        f.write(f"  GEOMETRY_ONLY: {geom_f1_per_fold.mean():.4f} ± {geom_f1_per_fold.std():.4f}\n")
+        f.write(f"  FULL PMI:      {full_f1_per_fold.mean():.4f} ± {full_f1_per_fold.std():.4f}\n")
+        f.write(f"  PMI Gain:      +{total_pmi_gain:.4f}\n\n")
+        
+        f.write("FEATURE GROUP IMPORTANCE:\n")
+        for idx, row in df_without.iterrows():
+            sig = "***" if row.get('p_holm', 1.0) < 0.001 else ("**" if row.get('p_holm', 1.0) < 0.01 else ("*" if row.get('Significant', False) else ""))
+            f.write(f"  {row['Group']:20s}: Drop={row['Performance_Drop']:.4f}, p={row.get('p_holm', row['Wilcoxon_p']):.4f} {sig}\n")
+        
+        if 'ONLY_KEY_PMI' in results:
+            key_row = df_final[df_final['Group'] == 'KEY_PMI (Dim+GeoTol)'].iloc[0]
+            f.write(f"\nKEY FEATURES ANALYSIS:\n")
+            f.write(f"  F1-Score:     {key_row['F1_mean']:.4f} ± {key_row['F1_std']:.4f}\n")
+            f.write(f"  Efficiency:   {key_row['Relative_Importance_%']:.1f}% of total PMI benefit\n")
+            f.write(f"  Features:     13/30 (43% of features)\n")
     
-    # Sort by importance
-    df_sorted = df.sort_values('Performance_Drop', ascending=False)
+    logger.info(f"Summary report saved to {OUTPUT_DIR / 'summary_report.txt'}")
     
-    # 1. Performance comparison with all baselines
-    ax = axes[0, 0]
+    # Print summary
+    logger.info("\n" + "="*60)
+    logger.info("📊 FEATURE GROUP IMPORTANCE RANKING (Holm-corrected)")
+    logger.info("="*60)
+    logger.info("Group                     | Drop    | 95% CI              | p-raw  | p-holm | Sig | Rel.Imp")
+    logger.info("-"*60)
+    for idx, row in df_without.iterrows():
+        sig_marker = "***" if row.get('p_holm', 1.0) < 0.001 else ("**" if row.get('p_holm', 1.0) < 0.01 else ("*" if row.get('Significant', False) else " "))
+        logger.info(f"{row['Group']:25s} | {row['Performance_Drop']:6.4f} | [{row['Drop_CI_Low']:5.4f}, {row['Drop_CI_High']:5.4f}] | "
+                   f"{row['Wilcoxon_p']:6.4f} | {row.get('p_holm', row['Wilcoxon_p']):6.4f} | {sig_marker:3s} | {row['Relative_Importance_%']:5.1f}%")
     
-    # Prepare data for boxplot
-    bp_data = [geom_f1, full_f1]
-    bp_labels = ['Geometry\nOnly', 'Full\nPMI']
+    if 'ONLY_KEY_PMI' in results:
+        logger.info("-"*60)
+        key_row = df_final[df_final['Group'] == 'KEY_PMI (Dim+GeoTol)'].iloc[0]
+        logger.info(f"{'KEY_PMI (13/30 features)':25s} | {key_row['F1_mean']:6.4f} | "
+                   f"Captures {key_row['Relative_Importance_%']:.1f}% of PMI benefit with 43% of features")
     
-    for group_name in df_sorted['Group']:
-        without_f1 = np.array([r['f1_macro'] for r in results[f'WITHOUT_{group_name}']])
-        bp_data.append(without_f1)
-        bp_labels.append(f'WITHOUT\n{group_name[:8]}')
+    logger.info("-"*60)
+    logger.info("Significance levels: *** p<0.001, ** p<0.01, * p<0.05")
     
-    bp = ax.boxplot(bp_data[:8], labels=bp_labels[:8], patch_artist=True)  # Show first 8 for space
-    bp['boxes'][0].set_facecolor('lightblue')  # Geometry
-    bp['boxes'][1].set_facecolor('darkgreen')  # Full PMI
-    for i in range(2, len(bp['boxes'])):
-        bp['boxes'][i].set_facecolor('coral')  # WITHOUT variants
-    
-    ax.set_ylabel('F1-Macro Score')
-    ax.set_title('Performance Across All Conditions')
-    ax.tick_params(axis='x', rotation=45)
-    ax.grid(True, alpha=0.3, axis='y')
-    
-    # 2. Performance drop with CI and significance
-    ax = axes[0, 1]
-    x_pos = np.arange(len(df_sorted))
-    bars = ax.bar(x_pos, df_sorted['Performance_Drop'], alpha=0.7, color='coral')
-    
-    # Color significant bars differently
-    for i, (idx, row) in enumerate(df_sorted.iterrows()):
-        if row['Significant']:
-            bars[i].set_color('darkred')
-    
-    ax.errorbar(x_pos, df_sorted['Performance_Drop'], 
-                yerr=[df_sorted['Performance_Drop'] - df_sorted['Drop_CI_Low'],
-                      df_sorted['Drop_CI_High'] - df_sorted['Performance_Drop']],
-                fmt='none', color='black', capsize=3)
-    
-    # Add significance stars
-    for i, (idx, row) in enumerate(df_sorted.iterrows()):
-        if row['Wilcoxon_p'] < 0.001:
-            ax.text(i, row['Drop_CI_High'] + 0.002, '***', ha='center', fontsize=10)
-        elif row['Wilcoxon_p'] < 0.01:
-            ax.text(i, row['Drop_CI_High'] + 0.002, '**', ha='center', fontsize=10)
-        elif row['Wilcoxon_p'] < 0.05:
-            ax.text(i, row['Drop_CI_High'] + 0.002, '*', ha='center', fontsize=10)
-    
-    ax.set_xticks(x_pos)
-    ax.set_xticklabels(df_sorted['Group'], rotation=45, ha='right')
-    ax.set_ylabel('F1-Macro Drop')
-    ax.set_title('Performance Drop When Removing Each PMI Group')
-    ax.grid(True, alpha=0.3, axis='y')
-    
-    # 3. Per-class impact heatmap
-    ax = axes[0, 2]
-    class_drops = df_sorted[['Group', 'Drop_Bohren', 'Drop_Drehen', 'Drop_Fraesen']].set_index('Group')
-    sns.heatmap(class_drops.T, annot=True, fmt='.3f', cmap='Reds', 
-                cbar_kws={'label': 'F1 Drop'}, ax=ax, vmin=0)
-    ax.set_xlabel('PMI Feature Group')
-    ax.set_ylabel('Manufacturing Process')
-    ax.set_title('Per-Class Performance Drop')
-    
-    # 4. Relative importance pie chart
-    ax = axes[1, 0]
-    colors = plt.cm.Reds(np.linspace(0.3, 0.9, len(df_sorted)))
-    wedges, texts, autotexts = ax.pie(df_sorted['Relative_Importance_%'], 
-                                       labels=df_sorted['Group'], 
-                                       autopct='%1.1f%%',
-                                       colors=colors,
-                                       startangle=90)
-    ax.set_title('Relative Importance of PMI Groups')
-    
-    # 5. Total gain decomposition
-    ax = axes[1, 1]
-    
-    # Calculate cumulative drops
-    sorted_drops = df_sorted['Performance_Drop'].values
-    cumulative = np.cumsum(sorted_drops)
-    total_gain = full_f1.mean() - geom_f1.mean()
-    
-    x = np.arange(len(df_sorted))
-    ax.bar(x, sorted_drops, alpha=0.7, label='Individual drop')
-    ax.plot(x, cumulative, 'r-o', label='Cumulative drop')
-    ax.axhline(total_gain, color='green', linestyle='--', label=f'Total PMI gain: {total_gain:.4f}')
-    
-    ax.set_xticks(x)
-    ax.set_xticklabels(df_sorted['Group'], rotation=45, ha='right')
-    ax.set_ylabel('F1-Macro')
-    ax.set_title('Cumulative Feature Group Contributions')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    
-    # 6. Statistical summary table
-    ax = axes[1, 2]
-    ax.axis('tight')
-    ax.axis('off')
-    
-    # Include baseline info in table
-    summary_data = [
-        ['BASELINE', '', '', '', ''],
-        ['Geometry', f"{geom_f1.mean():.3f}", '-', '-', '-'],
-        ['Full PMI', f"{full_f1.mean():.3f}", '-', '-', '-'],
-        ['Total Gain', f"{total_gain:.3f}", '-', '-', '-'],
-        ['', '', '', '', ''],
-        ['ABLATIONS', '', '', '', '']
-    ]
-    
-    for _, row in df_sorted.head(4).iterrows():
-        sig_marker = '✓' if row['Significant'] else '✗'
-        summary_data.append([
-            row['Group'][:12],
-            f"{row['Performance_Drop']:.3f}",
-            f"[{row['Drop_CI_Low']:.3f}, {row['Drop_CI_High']:.3f}]",
-            f"{row['Wilcoxon_p']:.3f}",
-            sig_marker
-        ])
-    
-    table = ax.table(cellText=summary_data,
-                     colLabels=['Condition', 'F1/Drop', '95% CI', 'p-value', 'Sig'],
-                     cellLoc='center',
-                     loc='center')
-    table.auto_set_font_size(False)
-    table.set_fontsize(9)
-    table.scale(1.1, 1.5)
-    
-    ax.set_title('Statistical Summary', fontsize=11, pad=20)
-    
-    plt.tight_layout()
-    plt.savefig(output_dir / 'ablation_results_complete.png', dpi=150, bbox_inches='tight')
-    plt.close()
-    
-    logger.info(f"\nPlots saved to {output_dir / 'ablation_results_complete.png'}")
+    return df_final
 
 
 if __name__ == "__main__":
     try:
-        results, analysis = run_without_x_ablations()
-        logger.info(f"\n✓ Ablation study completed successfully!")
+        results, analysis = run_feature_removal_ablations()
+        logger.info(f"\n" + "="*80)
+        logger.info("✓ ABLATION STUDY COMPLETED SUCCESSFULLY!")
+        logger.info("="*80)
         logger.info(f"✓ Results saved in: {OUTPUT_DIR}")
         
-        # Print key findings
         logger.info("\n" + "="*80)
-        logger.info("KEY FINDINGS")
+        logger.info("🔑 KEY FINDINGS")
         logger.info("="*80)
         
-        top3 = analysis.nlargest(3, 'Performance_Drop')
-        logger.info("\nMost important PMI groups (by paired drop):")
-        for idx, row in top3.iterrows():
-            sig = "✓" if row['Significant'] else ""
-            logger.info(f"  • {row['Group']}: {row['Relative_Importance_%']:.1f}% "
-                       f"(p={row['Wilcoxon_p']:.3f}) {sig}")
+        # Top WITHOUT groups
+        df_without = analysis[analysis['Type'] == 'WITHOUT']
+        if len(df_without) > 0:
+            top3 = df_without.nlargest(3, 'Performance_Drop')
+            logger.info("\n📍 Most important PMI groups (by performance drop):")
+            for i, (idx, row) in enumerate(top3.iterrows(), 1):
+                sig = "✓ (significant)" if row.get('Significant', False) else "✗ (not significant)"
+                logger.info(f"  {i}. {row['Group']}: {row['Relative_Importance_%']:.1f}% of total PMI gain")
+                logger.info(f"     Drop: {row['Performance_Drop']:.4f}, p={row['Wilcoxon_p']:.3f} {sig}")
         
-        logger.info("\nGreatest impact on Drehen/Fräsen discrimination:")
-        df_fraesen = analysis.nlargest(3, 'Drop_Fraesen')
-        for idx, row in df_fraesen.iterrows():
-            logger.info(f"  • {row['Group']}: Fräsen drop = {row['Drop_Fraesen']:.3f}")
+        # KEY_PMI efficiency
+        if 'KEY_PMI (Dim+GeoTol)' in analysis['Group'].values:
+            key_row = analysis[analysis['Group'] == 'KEY_PMI (Dim+GeoTol)'].iloc[0]
+            logger.info(f"\n🎯 KEY FEATURES EFFICIENCY:")
+            logger.info(f"  • Uses only 13/30 features (43%)")
+            logger.info(f"  • Achieves F1={key_row['F1_mean']:.4f}")
+            logger.info(f"  • Captures {key_row['Relative_Importance_%']:.1f}% of total PMI benefit")
         
-        # Summary statistics
-        significant_groups = analysis[analysis['Significant']]
-        logger.info(f"\nStatistically significant groups: {len(significant_groups)}/{len(analysis)}")
+        # Statistical summary
+        significant_groups = df_without[df_without.get('Significant', False) == True] if 'Significant' in df_without.columns else pd.DataFrame()
+        logger.info(f"\n📈 Statistical summary:")
+        logger.info(f"  • Significant groups: {len(significant_groups)}/{len(df_without)}")
         if len(significant_groups) > 0:
-            logger.info("Significant groups: " + 
-                       ", ".join(significant_groups['Group'].tolist()))
+            logger.info(f"  • Names: {', '.join(significant_groups['Group'].tolist())}")
             
     except Exception as e:
         logger.error(f"Error during ablation study: {str(e)}", exc_info=True)

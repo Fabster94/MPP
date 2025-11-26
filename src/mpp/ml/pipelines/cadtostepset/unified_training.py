@@ -229,10 +229,10 @@ def objective(trial, use_pmi=False, use_key_pmi=False, batch_size=85):
     
     if use_pmi or use_key_pmi:
         initial_gate = trial.suggest_float("initial_gate", 0.1, 0.5)
-        modality_dropout = trial.suggest_float("modality_dropout", 0.1, 0.5)
+        #modality_dropout = trial.suggest_float("modality_dropout", 0.1, 0.5)
     else:
         initial_gate = 0.2
-        modality_dropout = 0.3
+        #modality_dropout = 0.3
     
     max_epochs = 50
     
@@ -255,7 +255,7 @@ def objective(trial, use_pmi=False, use_key_pmi=False, batch_size=85):
         use_pmi=(use_pmi or use_key_pmi),
         pmi_dim=pmi_dim,  # Use dynamic pmi_dim
         initial_gate=initial_gate,
-        modality_dropout=modality_dropout
+        #modality_dropout=modality_dropout
     )
     
     # Callbacks
@@ -289,7 +289,7 @@ def objective(trial, use_pmi=False, use_key_pmi=False, batch_size=85):
             "path": PMI_PATH,
             "clip_value": CLIP_VALUE,
             "initial_gate": initial_gate,
-            "modality_dropout": modality_dropout
+           # "modality_dropout": modality_dropout
         }
         if use_key_pmi:
             model_config["key_features"] = KEY_FEATURES
@@ -430,7 +430,7 @@ def train_baseline(use_pmi=False, use_key_pmi=False, batch_size=85, best_params=
                 "use_pmi": True,
                 "pmi_dim": pmi_dim,  # Dynamic: 13 for key, 30 for full
                 "initial_gate": 0.171,
-                "modality_dropout": 0.206
+                "modality_dropout": 0.0 # 0.206
             }
         else:
             # Geometry defaults (from your best HP_GEOM)
