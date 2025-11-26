@@ -42,14 +42,14 @@ BATCH_SIZE = 85
 MAX_EPOCHS = 100
 PATIENCE = 20
 CLASS_NAMES = ["Bohren", "Drehen", "Fräsen"]
-NUM_WORKERS = 3  # Faster data loading with multiple workers
+NUM_WORKERS = 0  # Faster data loading with multiple workers
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 N_BOOTSTRAP = 5000
 ALPHA = 0.05
 
 # Path to your existing results
-PREVIOUS_RESULTS_PATH = Path("/workspace/masterthesis_cadtoplan_fabian_heinze/mpp/ablation_results_removal/20251020_164726/ablation_raw_results.json")
+PREVIOUS_RESULTS_PATH = Path("/workspace/masterthesis_cadtoplan_fabian_heinze/ablation_results_removal/20251020_164726/ablation_raw_results.json")
 
 OUTPUT_DIR = Path("ablation_results_removal") / datetime.now().strftime("%Y%m%d_%H%M%S")
 OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
@@ -89,7 +89,7 @@ HP_PMI = {
     "use_pmi": True,
     "pmi_dim": 30,
     "initial_gate": 0.171,
-    "modality_dropout": 0.206
+    "modality_dropout": 0.0 #0.206
 }
 
 PMI_CONFIG = {}
