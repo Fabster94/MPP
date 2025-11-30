@@ -70,7 +70,19 @@ class UnifiedProcessClassifier(pl.LightningModule):
     initial_gate : float, optional
         Initial value for PMI gating mechanism (default: 0.2).
     modality_dropout : float, optional
-        Probability of dropping PMI features during training (default: 0.3).
+        Probability of dropping PMI features during training (default: 0.0).
+    pmi_hidden_dim : int, optional
+        Hidden dimension for PMI encoder MLP (default: 128).
+    pmi_num_layers : int, optional
+        Number of hidden layers in PMI encoder (default: 2).
+    pmi_dropout : float, optional
+        Dropout probability for PMI encoder (default: 0.2).
+    fusion_hidden_dim : int, optional
+        Hidden dimension for fusion MLP (default: 128).
+    fusion_num_layers : int, optional
+        Number of layers in fusion network (default: 1).
+    fusion_dropout : float, optional
+        Dropout probability for fusion network (default: 0.2).
     
     Examples
     --------
@@ -80,8 +92,15 @@ class UnifiedProcessClassifier(pl.LightningModule):
     >>> logits = model(vecset)
     >>> print(logits.shape)  # torch.Size([4, 3])
     
-    >>> # Multi-modal model
-    >>> model = UnifiedProcessClassifier(use_pmi=True, pmi_dim=30)
+    >>> # Multi-modal model with custom PMI/Fusion config
+    >>> model = UnifiedProcessClassifier(
+    ...     use_pmi=True, 
+    ...     pmi_dim=30,
+    ...     pmi_hidden_dim=256,
+    ...     pmi_num_layers=3,
+    ...     fusion_hidden_dim=128,
+    ...     fusion_num_layers=2
+    ... )
     >>> vecset = torch.randn(4, 1024, 32)
     >>> pmi = torch.randn(4, 30)
     >>> logits = model(vecset, pmi)
@@ -110,7 +129,15 @@ class UnifiedProcessClassifier(pl.LightningModule):
         max_epochs: int = 200,
         use_pmi: bool = False,
         initial_gate: float = 0.2,
-        modality_dropout: float = 0.0
+        modality_dropout: float = 0.0,
+        # NEW: PMI Encoder parameters
+        pmi_hidden_dim: int = 128,
+        pmi_num_layers: int = 2,
+        pmi_dropout: float = 0.2,
+        # NEW: Fusion parameters
+        fusion_hidden_dim: int = 128,
+        fusion_num_layers: int = 1,
+        fusion_dropout: float = 0.2,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -129,25 +156,27 @@ class UnifiedProcessClassifier(pl.LightningModule):
         # PMI-specific components (only created if use_pmi=True)
         if use_pmi:
             logger.info(f"Enabling PMI mode with pmi_dim={pmi_dim}")
+            logger.info(f"  PMI Encoder: hidden_dim={pmi_hidden_dim}, num_layers={pmi_num_layers}, dropout={pmi_dropout}")
+            logger.info(f"  Fusion: hidden_dim={fusion_hidden_dim}, num_layers={fusion_num_layers}, dropout={fusion_dropout}")
             
-            # PMI encoder - MLP with LayerNorm
-            self.pmi_encoder = nn.Sequential(
-                nn.Linear(pmi_dim, 128),
-                nn.LayerNorm(128),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(128, embed_dim),
-                nn.LayerNorm(embed_dim)
+            # Build PMI encoder with configurable architecture
+            self.pmi_encoder = self._build_pmi_encoder(
+                pmi_dim=pmi_dim,
+                pmi_hidden_dim=pmi_hidden_dim,
+                pmi_num_layers=pmi_num_layers,
+                pmi_dropout=pmi_dropout,
+                embed_dim=embed_dim
             )
             
             # Gating mechanism for adaptive PMI contribution
             self.gate = nn.Parameter(torch.tensor(initial_gate))
             
-            # Fusion layer processes combined features
-            self.fusion = nn.Sequential(
-                nn.Linear(embed_dim, embed_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout)
+            # Build fusion layer with configurable architecture
+            self.fusion = self._build_fusion(
+                embed_dim=embed_dim,
+                fusion_hidden_dim=fusion_hidden_dim,
+                fusion_num_layers=fusion_num_layers,
+                fusion_dropout=fusion_dropout
             )
         else:
             logger.info("Using geometry-only mode (no PMI)")
@@ -162,6 +191,119 @@ class UnifiedProcessClassifier(pl.LightningModule):
         self.criterion = nn.BCEWithLogitsLoss()
         
         logger.info(f"Model initialized with {self.count_parameters():,} parameters")
+    
+    def _build_pmi_encoder(
+        self, 
+        pmi_dim: int, 
+        pmi_hidden_dim: int, 
+        pmi_num_layers: int, 
+        pmi_dropout: float, 
+        embed_dim: int
+    ) -> nn.Sequential:
+        """
+        Build PMI encoder MLP with configurable depth and width.
+        
+        Architecture:
+        - pmi_num_layers=1: pmi_dim -> pmi_hidden_dim -> embed_dim
+        - pmi_num_layers=2: pmi_dim -> pmi_hidden_dim -> pmi_hidden_dim -> embed_dim
+        - pmi_num_layers=3: pmi_dim -> pmi_hidden_dim -> pmi_hidden_dim -> pmi_hidden_dim -> embed_dim
+        
+        Parameters
+        ----------
+        pmi_dim : int
+            Input PMI feature dimension
+        pmi_hidden_dim : int
+            Hidden layer dimension
+        pmi_num_layers : int
+            Number of hidden layers (1-3)
+        pmi_dropout : float
+            Dropout probability
+        embed_dim : int
+            Output dimension (matches geometry encoder output)
+        
+        Returns
+        -------
+        nn.Sequential
+            PMI encoder network
+        """
+        layers = []
+        
+        # First layer: pmi_dim -> pmi_hidden_dim
+        layers.extend([
+            nn.Linear(pmi_dim, pmi_hidden_dim),
+            nn.LayerNorm(pmi_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(pmi_dropout)
+        ])
+        
+        # Additional hidden layers (if pmi_num_layers > 1)
+        for _ in range(pmi_num_layers - 1):
+            layers.extend([
+                nn.Linear(pmi_hidden_dim, pmi_hidden_dim),
+                nn.LayerNorm(pmi_hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(pmi_dropout)
+            ])
+        
+        # Final projection to embed_dim
+        layers.extend([
+            nn.Linear(pmi_hidden_dim, embed_dim),
+            nn.LayerNorm(embed_dim)
+        ])
+        
+        return nn.Sequential(*layers)
+    
+    def _build_fusion(
+        self, 
+        embed_dim: int, 
+        fusion_hidden_dim: int, 
+        fusion_num_layers: int, 
+        fusion_dropout: float
+    ) -> nn.Sequential:
+        """
+        Build fusion network with configurable depth and width.
+        
+        Architecture:
+        - fusion_num_layers=1: embed_dim -> embed_dim (simple residual-like)
+        - fusion_num_layers=2: embed_dim -> fusion_hidden_dim -> embed_dim
+        
+        Parameters
+        ----------
+        embed_dim : int
+            Input/output dimension (fused feature dimension)
+        fusion_hidden_dim : int
+            Hidden layer dimension (used when num_layers > 1)
+        fusion_num_layers : int
+            Number of layers (1-2)
+        fusion_dropout : float
+            Dropout probability
+        
+        Returns
+        -------
+        nn.Sequential
+            Fusion network
+        """
+        layers = []
+        
+        if fusion_num_layers == 1:
+            # Simple single-layer fusion: embed_dim -> embed_dim
+            layers.extend([
+                nn.Linear(embed_dim, embed_dim),
+                nn.ReLU(),
+                nn.Dropout(fusion_dropout)
+            ])
+        else:
+            # Two-layer fusion with hidden dimension: embed_dim -> fusion_hidden_dim -> embed_dim
+            layers.extend([
+                nn.Linear(embed_dim, fusion_hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(fusion_dropout),
+                nn.Linear(fusion_hidden_dim, embed_dim),
+                nn.ReLU(),
+                nn.Dropout(fusion_dropout)
+            ])
+        
+        return nn.Sequential(*layers)
     
     def forward(self, vecset: torch.Tensor, pmi_features: torch.Tensor = None) -> torch.Tensor:
         """
@@ -346,7 +488,17 @@ class UnifiedProcessClassifier(pl.LightningModule):
         
         if self.hparams.use_pmi:
             summary["pmi_encoder_params"] = sum(p.numel() for p in self.pmi_encoder.parameters())
+            summary["pmi_config"] = {
+                "hidden_dim": self.hparams.pmi_hidden_dim,
+                "num_layers": self.hparams.pmi_num_layers,
+                "dropout": self.hparams.pmi_dropout
+            }
             summary["fusion_params"] = sum(p.numel() for p in self.fusion.parameters())
+            summary["fusion_config"] = {
+                "hidden_dim": self.hparams.fusion_hidden_dim,
+                "num_layers": self.hparams.fusion_num_layers,
+                "dropout": self.hparams.fusion_dropout
+            }
             summary["gate_value"] = torch.sigmoid(self.gate).item()
         
         return summary
@@ -374,8 +526,8 @@ if __name__ == "__main__":
     print(f"Architecture: {model_geom.get_architecture_summary()}")
     print("✓ Test 1 passed")
     
-    # Test 2: Multi-modal mode
-    print("\nTest 2: Multi-modal mode")
+    # Test 2: Multi-modal mode (default PMI/Fusion config)
+    print("\nTest 2: Multi-modal mode (default config)")
     model_pmi = UnifiedProcessClassifier(use_pmi=True, pmi_dim=pmi_dim)
     pmi = torch.randn(batch_size, pmi_dim)
     logits = model_pmi(vecset, pmi)
@@ -385,38 +537,64 @@ if __name__ == "__main__":
     print(f"Architecture: {model_pmi.get_architecture_summary()}")
     print("✓ Test 2 passed")
     
-    # Test 3: Training step (geometry-only)
-    print("\nTest 3: Training step (geometry-only)")
+    # Test 3: Multi-modal mode with custom PMI/Fusion config
+    print("\nTest 3: Multi-modal mode (custom config)")
+    model_custom = UnifiedProcessClassifier(
+        use_pmi=True, 
+        pmi_dim=pmi_dim,
+        pmi_hidden_dim=256,
+        pmi_num_layers=3,
+        pmi_dropout=0.3,
+        fusion_hidden_dim=128,
+        fusion_num_layers=2,
+        fusion_dropout=0.25
+    )
+    logits = model_custom(vecset, pmi)
+    print(f"Output shape: {logits.shape}")
+    assert logits.shape == (batch_size, 3), "Output shape mismatch!"
+    summary = model_custom.get_architecture_summary()
+    print(f"PMI config: {summary['pmi_config']}")
+    print(f"Fusion config: {summary['fusion_config']}")
+    print(f"Total params: {summary['total_parameters']:,}")
+    print("✓ Test 3 passed")
+    
+    # Test 4: Training step (geometry-only)
+    print("\nTest 4: Training step (geometry-only)")
     labels = torch.randint(0, 2, (batch_size, 3)).float()
     batch_geom = (vecset, labels)
     loss = model_geom.training_step(batch_geom, 0)
     print(f"Training loss: {loss.item():.4f}")
-    print("✓ Test 3 passed")
+    print("✓ Test 4 passed")
     
-    # Test 4: Training step (multi-modal)
-    print("\nTest 4: Training step (multi-modal)")
+    # Test 5: Training step (multi-modal)
+    print("\nTest 5: Training step (multi-modal)")
     batch_pmi = ((vecset, pmi), labels)
     loss = model_pmi.training_step(batch_pmi, 0)
     print(f"Training loss: {loss.item():.4f}")
-    print("✓ Test 4 passed")
+    print("✓ Test 5 passed")
     
-    # Test 5: Error handling
-    print("\nTest 5: Error handling (missing PMI)")
+    # Test 6: Error handling
+    print("\nTest 6: Error handling (missing PMI)")
     try:
         model_pmi(vecset)  # Should raise error
-        print("✗ Test 5 failed - should have raised ValueError")
+        print("✗ Test 6 failed - should have raised ValueError")
     except ValueError as e:
         print(f"Correctly raised ValueError: {e}")
-        print("✓ Test 5 passed")
+        print("✓ Test 6 passed")
     
-    # Test 6: Parameter comparison
-    print("\nTest 6: Parameter comparison")
-    geom_params = model_geom.count_parameters()
-    pmi_params = model_pmi.count_parameters()
-    print(f"Geometry-only model: {geom_params:,} parameters")
-    print(f"Multi-modal model: {pmi_params:,} parameters")
-    print(f"PMI adds: {pmi_params - geom_params:,} parameters")
-    print("✓ Test 6 passed")
+    # Test 7: Parameter comparison across configurations
+    print("\nTest 7: Parameter comparison")
+    configs = [
+        {"name": "Geometry-only", "use_pmi": False},
+        {"name": "PMI default", "use_pmi": True, "pmi_dim": 30},
+        {"name": "PMI small", "use_pmi": True, "pmi_dim": 30, "pmi_hidden_dim": 64, "pmi_num_layers": 1, "fusion_num_layers": 1},
+        {"name": "PMI large", "use_pmi": True, "pmi_dim": 30, "pmi_hidden_dim": 256, "pmi_num_layers": 3, "fusion_num_layers": 2},
+    ]
+    for cfg in configs:
+        name = cfg.pop("name")
+        model = UnifiedProcessClassifier(**cfg)
+        print(f"  {name}: {model.count_parameters():,} parameters")
+    print("✓ Test 7 passed")
     
     print("\n" + "="*60)
     print("All tests passed! ✓")

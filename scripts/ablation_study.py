@@ -48,8 +48,8 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 N_BOOTSTRAP = 5000
 ALPHA = 0.05
 
-# Path to your existing results
-PREVIOUS_RESULTS_PATH = Path("/workspace/masterthesis_cadtoplan_fabian_heinze/ablation_results_removal/20251020_164726/ablation_raw_results.json")
+# Path to your existing results (set to None to start fresh)
+PREVIOUS_RESULTS_PATH = None
 
 OUTPUT_DIR = Path("ablation_results_removal") / datetime.now().strftime("%Y%m%d_%H%M%S")
 OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
@@ -65,31 +65,53 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Best hyperparameters from main CV - FIXED VERSION
+# Best hyperparameters from tuning (2025-11-26)
 HP_GEOM = {
-    "dropout": 0.224,
-    "lr": 0.000326,
+    # Geometry Encoder
     "embed_dim": 128,
-    "num_layers": 2,
+    "num_layers": 5,
     "num_heads": 16,
-    "weight_decay": 0.000374,
+    "dropout": 0.154,
+    # Optimizer
+    "lr": 0.000165,
+    "weight_decay": 4.19e-05,
+    # PMI settings (not used but required)
     "use_pmi": False,
     "pmi_dim": 30,
     "initial_gate": 0.2,
-    "modality_dropout": 0.0
+    "modality_dropout": 0.0,
+    # PMI Encoder (not used but required for model init)
+    "pmi_hidden_dim": 128,
+    "pmi_num_layers": 2,
+    "pmi_dropout": 0.2,
+    # Fusion (not used but required for model init)
+    "fusion_hidden_dim": 128,
+    "fusion_num_layers": 1,
+    "fusion_dropout": 0.2,
 }
 
 HP_PMI = {
-    "dropout": 0.280,
-    "lr": 0.000690,
-    "embed_dim": 64,
-    "num_layers": 3,
-    "num_heads": 8,
-    "weight_decay": 0.000277,
+    # Geometry Encoder
+    "embed_dim": 128,
+    "num_layers": 5,
+    "num_heads": 16,
+    "dropout": 0.344,
+    # Optimizer
+    "lr": 0.000154,
+    "weight_decay": 0.000164,
+    # PMI settings
     "use_pmi": True,
     "pmi_dim": 30,
-    "initial_gate": 0.171,
-    "modality_dropout": 0.0 #0.206
+    "initial_gate": 0.412,
+    "modality_dropout": 0.0,
+    # PMI Encoder (NEW - from tuning)
+    "pmi_hidden_dim": 256,
+    "pmi_num_layers": 1,
+    "pmi_dropout": 0.339,
+    # Fusion (NEW - from tuning)
+    "fusion_hidden_dim": 128,
+    "fusion_num_layers": 1,
+    "fusion_dropout": 0.417,
 }
 
 PMI_CONFIG = {}
@@ -398,6 +420,8 @@ def run_feature_removal_ablations():
     logger.info(f"Configuration: {N_REPEATS}×{N_FOLDS} = {N_REPEATS*N_FOLDS} total folds")
     logger.info(f"Batch size: {BATCH_SIZE}, Max epochs: {MAX_EPOCHS}, Patience: {PATIENCE}")
     logger.info(f"Device: {DEVICE}")
+    logger.info(f"Hyperparameters GEOM: {HP_GEOM}")
+    logger.info(f"Hyperparameters PMI: {HP_PMI}")
     logger.info("="*80)
     
     feature_groups = get_pmi_feature_groups()
@@ -408,7 +432,7 @@ def run_feature_removal_ablations():
     all_splits = generate_all_splits(labels_augmented)
     
     # Check if previous results exist to skip completed experiments
-    if PREVIOUS_RESULTS_PATH.exists():
+    if PREVIOUS_RESULTS_PATH is not None and Path(PREVIOUS_RESULTS_PATH).exists():
         logger.info(f"\n⚠️  Loading existing results from: {PREVIOUS_RESULTS_PATH}")
         with open(PREVIOUS_RESULTS_PATH, 'r') as f:
             existing_data = json.load(f)
@@ -416,8 +440,7 @@ def run_feature_removal_ablations():
         logger.info(f"   Loaded results for: {list(all_results.keys())}")
         logger.info(f"   Number of folds per experiment: {len(all_results.get('GEOMETRY_ONLY', []))}")
     else:
-        logger.info(f"\n⚠️  No previous results found at: {PREVIOUS_RESULTS_PATH}")
-        logger.info("   Starting fresh with all experiments...")
+        logger.info(f"\n⚠️  No previous results to load, starting fresh...")
         all_results = {}
     
     # Save splits with indices

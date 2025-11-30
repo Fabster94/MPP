@@ -65,31 +65,53 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Best hyperparameters
+# Best hyperparameters from tuning (2025-11-26)
 HP_GEOM = {
-    "dropout": 0.224,
-    "lr": 0.000326,
+    # Geometry Encoder
     "embed_dim": 128,
-    "num_layers": 2,
+    "num_layers": 5,
     "num_heads": 16,
-    "weight_decay": 0.000374,
+    "dropout": 0.154,
+    # Optimizer
+    "lr": 0.000165,
+    "weight_decay": 4.19e-05,
+    # PMI settings (not used but required)
     "use_pmi": False,
     "pmi_dim": 30,
     "initial_gate": 0.2,
-    "modality_dropout": 0.0
+    "modality_dropout": 0.0,
+    # PMI Encoder (not used but required for model init)
+    "pmi_hidden_dim": 128,
+    "pmi_num_layers": 2,
+    "pmi_dropout": 0.2,
+    # Fusion (not used but required for model init)
+    "fusion_hidden_dim": 128,
+    "fusion_num_layers": 1,
+    "fusion_dropout": 0.2,
 }
 
 HP_PMI = {
-    "dropout": 0.280,
-    "lr": 0.000690,
-    "embed_dim": 64,
-    "num_layers": 3,
-    "num_heads": 8,
-    "weight_decay": 0.000277,
+    # Geometry Encoder
+    "embed_dim": 128,
+    "num_layers": 5,
+    "num_heads": 16,
+    "dropout": 0.344,
+    # Optimizer
+    "lr": 0.000154,
+    "weight_decay": 0.000164,
+    # PMI settings
     "use_pmi": True,
     "pmi_dim": 30,
-    "initial_gate": 0.171,
-    "modality_dropout": 0.0 #0.206
+    "initial_gate": 0.412,
+    "modality_dropout": 0.0,
+    # PMI Encoder (NEW - from tuning)
+    "pmi_hidden_dim": 256,
+    "pmi_num_layers": 1,
+    "pmi_dropout": 0.339,
+    # Fusion (NEW - from tuning)
+    "fusion_hidden_dim": 128,
+    "fusion_num_layers": 1,
+    "fusion_dropout": 0.417,
 }
 
 PMI_CONFIG = {
@@ -709,6 +731,8 @@ def run_repeated_cross_validation():
     logger.info("="*80)
     logger.info("EXTENDED CROSS-VALIDATION")
     logger.info("="*80)
+    logger.info(f"Hyperparameters GEOM: {HP_GEOM}")
+    logger.info(f"Hyperparameters PMI: {HP_PMI}")
     
     # Load data
     dataset_geom, dataset_pmi, labels, labels_augmented, sample_ids = load_datasets_with_alignment()
@@ -751,7 +775,9 @@ def run_repeated_cross_validation():
             'n_repeats': N_REPEATS,
             'total_folds': N_FOLDS * N_REPEATS,
             'class_names': CLASS_NAMES,
-            'threshold': 0.5
+            'threshold': 0.5,
+            'hp_geom': HP_GEOM,
+            'hp_pmi': HP_PMI
         },
         'results_pmi': results_pmi,
         'results_geom': results_geom,

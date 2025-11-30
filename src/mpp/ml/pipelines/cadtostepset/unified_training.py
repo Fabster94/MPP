@@ -219,20 +219,43 @@ def objective(trial, use_pmi=False, use_key_pmi=False, batch_size=85):
         run_name=trial_id
     )
     
-    # Define hyperparameter search space
-    dropout = trial.suggest_float("dropout", 0.1, 0.5)
-    lr = trial.suggest_float("lr", 1e-4, 3e-3, log=True)
+    # =========================================================================
+    # HYPERPARAMETER SEARCH SPACE
+    # =========================================================================
+    
+    # Geometry Encoder parameters
     embed_dim = trial.suggest_categorical("embed_dim", [64, 128, 256])
     num_layers = trial.suggest_int("num_layers", 2, 5)
     num_heads = trial.suggest_categorical("num_heads", [4, 8, 16])
+    dropout = trial.suggest_float("dropout", 0.1, 0.5)
+    
+    # Optimizer parameters
+    lr = trial.suggest_float("lr", 1e-4, 3e-3, log=True)
     weight_decay = trial.suggest_float("weight_decay", 1e-5, 1e-3, log=True)
     
+    # PMI-specific parameters (only tuned when using PMI)
     if use_pmi or use_key_pmi:
+        # Gating mechanism
         initial_gate = trial.suggest_float("initial_gate", 0.1, 0.5)
-        #modality_dropout = trial.suggest_float("modality_dropout", 0.1, 0.5)
+        
+        # PMI Encoder parameters
+        pmi_hidden_dim = trial.suggest_categorical("pmi_hidden_dim", [64, 128, 256])
+        pmi_num_layers = trial.suggest_int("pmi_num_layers", 1, 3)
+        pmi_dropout = trial.suggest_float("pmi_dropout", 0.1, 0.5)
+        
+        # Fusion parameters
+        fusion_hidden_dim = trial.suggest_categorical("fusion_hidden_dim", [64, 128, 256])
+        fusion_num_layers = trial.suggest_int("fusion_num_layers", 1, 2)
+        fusion_dropout = trial.suggest_float("fusion_dropout", 0.1, 0.5)
     else:
+        # Default values for geometry-only mode (not used but needed for model init)
         initial_gate = 0.2
-        #modality_dropout = 0.3
+        pmi_hidden_dim = 128
+        pmi_num_layers = 2
+        pmi_dropout = 0.2
+        fusion_hidden_dim = 128
+        fusion_num_layers = 1
+        fusion_dropout = 0.2
     
     max_epochs = 50
     
@@ -243,19 +266,29 @@ def objective(trial, use_pmi=False, use_key_pmi=False, batch_size=85):
         use_key_pmi=use_key_pmi
     )
     
-    # Initialize unified model
+    # Initialize unified model with all parameters
     model = UnifiedProcessClassifier(
-        lr=lr,
+        # Geometry encoder
         embed_dim=embed_dim,
         num_layers=num_layers,
         num_heads=num_heads,
         dropout=dropout,
+        # Optimizer
+        lr=lr,
         weight_decay=weight_decay,
         max_epochs=max_epochs,
+        # PMI settings
         use_pmi=(use_pmi or use_key_pmi),
-        pmi_dim=pmi_dim,  # Use dynamic pmi_dim
+        pmi_dim=pmi_dim,
         initial_gate=initial_gate,
-        #modality_dropout=modality_dropout
+        # PMI Encoder
+        pmi_hidden_dim=pmi_hidden_dim,
+        pmi_num_layers=pmi_num_layers,
+        pmi_dropout=pmi_dropout,
+        # Fusion
+        fusion_hidden_dim=fusion_hidden_dim,
+        fusion_num_layers=fusion_num_layers,
+        fusion_dropout=fusion_dropout,
     )
     
     # Callbacks
@@ -269,15 +302,19 @@ def objective(trial, use_pmi=False, use_key_pmi=False, batch_size=85):
     trial_dir = CURRENT_EXPERIMENT_DIR / "trials" / f"trial_{trial.number}"
     trial_dir.mkdir(parents=True, exist_ok=True)
     
+    # Build model config for logging
     model_config = {
         "trial_number": trial.number,
         "mode": mode_str,
-        "lr": lr,
+        # Geometry encoder
         "embed_dim": embed_dim,
         "num_layers": num_layers,
         "num_heads": num_heads,
         "dropout": dropout,
+        # Optimizer
+        "lr": lr,
         "weight_decay": weight_decay,
+        # General
         "use_pmi": use_pmi,
         "use_key_pmi": use_key_pmi,
         "pmi_dim": pmi_dim,
@@ -289,7 +326,14 @@ def objective(trial, use_pmi=False, use_key_pmi=False, batch_size=85):
             "path": PMI_PATH,
             "clip_value": CLIP_VALUE,
             "initial_gate": initial_gate,
-           # "modality_dropout": modality_dropout
+            # PMI Encoder
+            "pmi_hidden_dim": pmi_hidden_dim,
+            "pmi_num_layers": pmi_num_layers,
+            "pmi_dropout": pmi_dropout,
+            # Fusion
+            "fusion_hidden_dim": fusion_hidden_dim,
+            "fusion_num_layers": fusion_num_layers,
+            "fusion_dropout": fusion_dropout,
         }
         if use_key_pmi:
             model_config["key_features"] = KEY_FEATURES
@@ -333,7 +377,7 @@ def objective(trial, use_pmi=False, use_key_pmi=False, batch_size=85):
         "pmi_dim": pmi_dim
     })
     
-    # Save trial info
+    # Save trial info with all parameters
     trial_info = {
         "trial_id": trial_id,
         "trial_number": trial.number,
@@ -413,12 +457,12 @@ def train_baseline(use_pmi=False, use_key_pmi=False, batch_size=85, best_params=
         model_params = best_params.copy()
         model_params["max_epochs"] = 300
         model_params["use_pmi"] = (use_pmi or use_key_pmi)
-        model_params["pmi_dim"] = pmi_dim  # Use dynamic pmi_dim
+        model_params["pmi_dim"] = pmi_dim
     else:
         print(f"\n📋 Using default parameters")
         # Default parameters based on mode
         if use_pmi or use_key_pmi:
-            # PMI defaults (from your best HP_PMI)
+            # PMI defaults
             model_params = {
                 "lr": 0.000690,
                 "embed_dim": 64,
@@ -428,12 +472,20 @@ def train_baseline(use_pmi=False, use_key_pmi=False, batch_size=85, best_params=
                 "weight_decay": 0.000277,
                 "max_epochs": 300,
                 "use_pmi": True,
-                "pmi_dim": pmi_dim,  # Dynamic: 13 for key, 30 for full
+                "pmi_dim": pmi_dim,
                 "initial_gate": 0.171,
-                "modality_dropout": 0.0 # 0.206
+                "modality_dropout": 0.0,
+                # PMI Encoder defaults
+                "pmi_hidden_dim": 128,
+                "pmi_num_layers": 2,
+                "pmi_dropout": 0.2,
+                # Fusion defaults
+                "fusion_hidden_dim": 128,
+                "fusion_num_layers": 1,
+                "fusion_dropout": 0.2,
             }
         else:
-            # Geometry defaults (from your best HP_GEOM)
+            # Geometry defaults
             model_params = {
                 "lr": 0.000326,
                 "embed_dim": 128,
@@ -443,9 +495,17 @@ def train_baseline(use_pmi=False, use_key_pmi=False, batch_size=85, best_params=
                 "weight_decay": 0.000374,
                 "max_epochs": 300,
                 "use_pmi": False,
-                "pmi_dim": 30,  # Still needed for model initialization
+                "pmi_dim": 30,
                 "initial_gate": 0.2,
-                "modality_dropout": 0.0
+                "modality_dropout": 0.0,
+                # PMI Encoder defaults (not used but needed)
+                "pmi_hidden_dim": 128,
+                "pmi_num_layers": 2,
+                "pmi_dropout": 0.2,
+                # Fusion defaults (not used but needed)
+                "fusion_hidden_dim": 128,
+                "fusion_num_layers": 1,
+                "fusion_dropout": 0.2,
             }
     
     # Initialize model
@@ -521,6 +581,12 @@ def train_baseline(use_pmi=False, use_key_pmi=False, batch_size=85, best_params=
         print(f"  PMI path: {PMI_PATH}")
         print(f"  PMI dimension: {pmi_dim}")
         print(f"  PMI clipping: {CLIP_VALUE}")
+        print(f"  PMI Encoder: hidden_dim={model_params.get('pmi_hidden_dim')}, "
+              f"num_layers={model_params.get('pmi_num_layers')}, "
+              f"dropout={model_params.get('pmi_dropout')}")
+        print(f"  Fusion: hidden_dim={model_params.get('fusion_hidden_dim')}, "
+              f"num_layers={model_params.get('fusion_num_layers')}, "
+              f"dropout={model_params.get('fusion_dropout')}")
     print(f"  Batch size: {batch_size}")
     print(f"  Max epochs: {model_params['max_epochs']}")
     print(f"  Checkpoint dir: {checkpoint_dir}")
@@ -548,7 +614,7 @@ def main():
     parser.add_argument("--use_pmi", action="store_true", help="Enable full PMI features (30)")
     parser.add_argument("--use_key_pmi", action="store_true", help="Enable KEY PMI features only (13)")
     parser.add_argument("--tune", action="store_true", help="Enable hyperparameter tuning")
-    parser.add_argument("--n_trials", type=int, default=100, help="Number of tuning trials")
+    parser.add_argument("--n_trials", type=int, default=200, help="Number of tuning trials")
     parser.add_argument("--batch_size", type=int, default=85, help="Batch size")
     args = parser.parse_args()
     
@@ -581,6 +647,13 @@ def main():
     print(f"Tuning: {'Enabled' if args.tune else 'Disabled'}")
     if args.tune:
         print(f"Number of trials: {args.n_trials}")
+        print(f"Search space:")
+        print(f"  Geometry: embed_dim, num_layers, num_heads, dropout")
+        print(f"  Optimizer: lr, weight_decay")
+        if args.use_pmi or args.use_key_pmi:
+            print(f"  PMI Encoder: pmi_hidden_dim, pmi_num_layers, pmi_dropout")
+            print(f"  Fusion: fusion_hidden_dim, fusion_num_layers, fusion_dropout")
+            print(f"  Gating: initial_gate")
     print(f"Batch size: {args.batch_size}")
     print(f"{'='*60}\n")
     
@@ -589,6 +662,35 @@ def main():
         experiment_name = f"{datetime.now().strftime('%Y-%m-%d_%H%M')}_unified_{mode_str}_tuning_{args.n_trials}trials"
         CURRENT_EXPERIMENT_DIR = PATHS.CKPT_DIR / "experiments" / experiment_name
         CURRENT_EXPERIMENT_DIR.mkdir(parents=True, exist_ok=True)
+        
+        # Define search space for documentation
+        search_space = {
+            "geometry_encoder": {
+                "embed_dim": [64, 128, 256],
+                "num_layers": "2-5",
+                "num_heads": [4, 8, 16],
+                "dropout": "0.1-0.5"
+            },
+            "optimizer": {
+                "lr": "1e-4 to 3e-3 (log)",
+                "weight_decay": "1e-5 to 1e-3 (log)"
+            }
+        }
+        
+        if args.use_pmi or args.use_key_pmi:
+            search_space["pmi_encoder"] = {
+                "pmi_hidden_dim": [64, 128, 256],
+                "pmi_num_layers": "1-3",
+                "pmi_dropout": "0.1-0.5"
+            }
+            search_space["fusion"] = {
+                "fusion_hidden_dim": [64, 128, 256],
+                "fusion_num_layers": "1-2",
+                "fusion_dropout": "0.1-0.5"
+            }
+            search_space["gating"] = {
+                "initial_gate": "0.1-0.5"
+            }
         
         # Save experiment metadata
         experiment_info = {
@@ -599,6 +701,7 @@ def main():
             "n_trials": args.n_trials,
             "use_pmi": args.use_pmi,
             "use_key_pmi": args.use_key_pmi,
+            "search_space": search_space,
             "created_at": datetime.now().isoformat(),
         }
         
@@ -632,13 +735,20 @@ def main():
         print(json.dumps(best_params, indent=2))
         print(f"Best validation loss: {study.best_value:.4f}")
         
-        # Save best parameters
+        # Save best parameters with all details
+        best_params_output = {
+            "params": best_params,
+            "value": study.best_value,
+            "trial_number": study.best_trial.number,
+            "mode": mode_str,
+            "use_pmi": args.use_pmi,
+            "use_key_pmi": args.use_key_pmi,
+            "n_trials": args.n_trials,
+            "saved_at": datetime.now().isoformat()
+        }
+        
         with open(CURRENT_EXPERIMENT_DIR / "best_params.json", "w") as f:
-            json.dump({
-                "params": best_params,
-                "value": study.best_value,
-                "trial_number": study.best_trial.number
-            }, f, indent=4)
+            json.dump(best_params_output, f, indent=4)
         
         # Ask if user wants to train with best parameters
         print("\n" + "="*60)
